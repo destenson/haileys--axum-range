@@ -88,6 +88,11 @@ pub trait RangeBody: AsyncRead + AsyncSeekStart {
     /// This should not change for the lifetime of the object once queried.
     /// Behaviour is not guaranteed if it does change.
     fn byte_size(&self) -> u64;
+    
+    /// Returns the block size of the body, if applicable.
+    /// This is used to determine how much data to read for a range request.
+    /// If not specified, the entire byte size is used.
+    fn block_len(&self) -> u64 { self.byte_size() }
 }
 
 /// Represents a single byte range with start and end positions (exclusive end).
@@ -128,15 +133,30 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
     pub fn try_respond(self) -> Result<RangedResponse<B>, RangeNotSatisfiable> {
         let total_bytes = self.body.byte_size();
 
+        let block_len = self.body.block_len();
+        
         match self.range {
             None => {
-                // no range header, return the whole file
-                let content_length = ContentLength(total_bytes);
-                let stream = RangedStream::new(self.body, 0, total_bytes);
-                Ok(RangedResponse::Full {
-                    content_length,
-                    stream,
-                })
+                if total_bytes <= block_len {
+                    // no range header, return the whole file
+                    let content_length = ContentLength(total_bytes);
+                    let stream = RangedStream::new(self.body, 0, total_bytes);
+                    Ok(RangedResponse::Full {
+                        content_length,
+                        stream,
+                    })
+                } else {
+                    // block_len is less than total_bytes, return the first block_len bytes
+                    let content_length = ContentLength(block_len);
+                    let stream = RangedStream::new(self.body, 0, block_len);
+                    let content_range = ContentRange::bytes(0..block_len, total_bytes)
+                        .expect("ContentRange::bytes cannot panic in this usage");
+                    Ok(RangedResponse::Single {
+                        content_range,
+                        content_length,
+                        stream,
+                    })
+                }
             }
             Some(range) => {
                 // Parse all satisfiable ranges
@@ -155,22 +175,100 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
 
                         let end = match end_bound {
                             // HTTP byte ranges are inclusive, so we translate to exclusive by adding 1
-                            // If end exceeds total_bytes, adjust it to total_bytes as per RFC
-                            Bound::Included(end) => std::cmp::min(end + 1, total_bytes),
-                            _ => total_bytes,
+                            Bound::Included(end) => end + 1,
+                            Bound::Excluded(end) => end,
+                            _ => start + block_len,
                         };
-
                         // Check for invalid conditions
                         if start >= end {
                             return None;
                         }
 
+                        // If end exceeds total_bytes, adjust it to total_bytes as per RFC
+                        let end = {
+                            let mut end = std::cmp::min(match end_bound {
+                                // HTTP byte ranges are inclusive, so we translate to exclusive by adding 1
+                                Bound::Included(end) => end + 1,
+                                Bound::Excluded(end) => end,
+                                _ => start + block_len,
+                            }, total_bytes);
+                            if end - start > block_len {
+                                start + block_len
+                            } else {
+                                end
+                            }
+                        };
+                        
                         Some(ByteRange::new(start, end))
                     })
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?;
 
                 if satisfiable_ranges.is_empty() {
+                    if range_str == "bytes=0-0" {
+                        // Special case for zero-length range request
+                        let content_range = ContentRange::bytes(0..0, total_bytes)
+                            .expect("ContentRange::bytes cannot panic in this usage");
+                        let content_length = ContentLength(0);
+                        let stream = RangedStream::new(self.body, 0, 0);
+                        return Ok(RangedResponse::Single {
+                            content_range,
+                            content_length,
+                            stream,
+                        });
+                    } else if range_str == "bytes=0-" {
+                        let start = total_bytes.saturating_sub(1);
+                        let content_range = ContentRange::bytes(start..total_bytes, total_bytes)
+                            .expect("ContentRange::bytes cannot panic in this usage");
+                        let content_length = ContentLength(total_bytes - start);
+                        let stream = RangedStream::new(self.body, start, total_bytes - start);
+                        return Ok(RangedResponse::Single {
+                            content_range,
+                            content_length,
+                            stream,
+                        });
+                    } else {
+                        if range_str.starts_with("bytes=") {
+                            let bytes = range_str[6..].trim();
+                            // If the range is like "bytes=-n", we can return the last n bytes
+                            let n: i64 = bytes.parse().unwrap();
+                            if n < 0 {
+                                // but that's ok, we can just return the whole file, or the block size
+                                // let n = total_bytes.wrapping_add(n as u64);
+                                if -n > total_bytes as i64 {
+                                    let content_range = ContentRange::bytes(0..total_bytes, total_bytes)
+                                        .expect("ContentRange::bytes cannot panic in this usage");
+                                    let content_length = ContentLength(total_bytes);
+                                    let stream = RangedStream::new(self.body, 0, total_bytes);
+                                    return Ok(RangedResponse::Single {
+                                        content_range,
+                                        content_length,
+                                        stream,
+                                    });
+                                } else {
+                                    todo!();
+                                }
+                            } else {
+                                todo!();
+                            }
+                            // let start = total_bytes.saturating_sub((-n) as u64);
+                            // let content_range = ContentRange::bytes(start..total_bytes, total_bytes)
+                            //     .expect("ContentRange::bytes cannot panic in this usage");
+                            // let content_length = ContentLength(n);
+                            // let stream = RangedStream::new(self.body, start, n);
+                            // return Ok(RangedResponse::Single {
+                            //     content_range,
+                            //     content_length,
+                            //     stream,
+                            // });
+                        } else {
+                            let bytes = range_str[6..].trim();
+                            eprintln!("bytes: {}", bytes);
+                            // if "bytes=-n" is requested, we can return the last n bytes up to the length of the file/block size
+                            eprintln!("No satisfiable ranges found for range: {}", range_str);
+                            todo!();
+                        }
+                    }
                     // TODO: try harder to match ranges that are RFC compliant
                     return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
                 }
@@ -570,7 +668,7 @@ mod rfc_compliance_tests {
     use tokio::fs::File;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use crate::{Ranged, KnownSize, RangedResponse, RangeNotSatisfiable};
+    use crate::{Ranged, KnownSize, RangedResponse, RangeNotSatisfiable, stream};
 
     // Utility functions for tests
     async fn collect_stream(stream: impl Stream<Item = io::Result<Bytes>>) -> String {
@@ -631,6 +729,11 @@ mod rfc_compliance_tests {
     async fn body(path: &str) -> KnownSize<File> {
         let file = File::open(path).await.unwrap();
         KnownSize::file(file).await.unwrap()
+    }
+
+    async fn body_blocks(path: &str, block_len: u64) -> KnownSize<File> {
+        let file = File::open(path).await.unwrap();
+        KnownSize::file_blocks(file, block_len).await.unwrap()
     }
 
     // Test setup that creates a test file with known content
@@ -808,7 +911,7 @@ mod rfc_compliance_tests {
                 let content = collect_multipart_stream(stream, &boundary).await;
                 assert_eq!("0z", &content); // First byte is '0', last byte is 'z'
             }
-            _ => panic!("Expected a single range response"),
+            _ => panic!("Expected a multiple range response"),
         }
 
         // assert_eq!(1, response.content_length.0);
@@ -915,6 +1018,52 @@ mod rfc_compliance_tests {
         // assert!(response.content_range.is_none());
         // let content = collect_stream(response.stream).await;
         // assert_eq!("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", &content);
+        Ok(())
+    }
+    
+    #[tokio::test]
+    async fn test_block_ranges() -> io::Result<()> {
+        let test_path = setup().await?;
+        let block_size = 10;
+        let body = body_blocks(&test_path, block_size).await;
+
+        // Test with block size of 10
+        let ranged = Ranged::new(range("bytes=0-29"), body);
+        let response = ranged.try_respond().expect("try_respond should return Ok");
+
+        match response {
+            RangedResponse::Single { content_range, content_length, stream } => {
+                assert_eq!(ContentLength(10), content_length);
+                assert_eq!(ContentRange::bytes(0..10, 62).unwrap(), content_range);
+                let content = collect_stream(stream).await;
+                assert_eq!("0123456789", &content);
+            }
+            _ => panic!("Expected a single range response"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_block_ranges_mid() -> io::Result<()> {
+        let test_path = setup().await?;
+        let block_size = 10;
+        let body = body_blocks(&test_path, block_size).await;
+
+        // Test with block size of 10
+        let ranged = Ranged::new(range("bytes=10-29"), body);
+        let response = ranged.try_respond().expect("try_respond should return Ok");
+
+        match response {
+            RangedResponse::Single { content_range, content_length, stream } => {
+                assert_eq!(ContentLength(10), content_length);
+                assert_eq!(ContentRange::bytes(10..20, 62).unwrap(), content_range);
+                let content = collect_stream(stream).await;
+                assert_eq!("ABCDEFGHIJ", &content);
+            }
+            _ => panic!("Expected a single range response"),
+        }
+
         Ok(())
     }
 }
