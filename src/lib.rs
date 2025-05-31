@@ -138,6 +138,7 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
         match self.range {
             None => {
                 if total_bytes <= block_len {
+                    eprintln!("No range header, returning full file of size: {}", total_bytes);
                     // no range header, return the whole file
                     let content_length = ContentLength(total_bytes);
                     let stream = RangedStream::new(self.body, 0, total_bytes);
@@ -146,6 +147,7 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                         stream,
                     })
                 } else {
+                    eprintln!("No range header, returning first {} bytes of file of size: {}", block_len, total_bytes);
                     // block_len is less than total_bytes, return the first block_len bytes
                     let content_length = ContentLength(block_len);
                     let stream = RangedStream::new(self.body, 0, block_len);
@@ -159,10 +161,15 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                 }
             }
             Some(range) => {
+                println!("range: {:?}", range);
+                // hacky way to get the range string for parsing
+                let mut range_str = format!("{:?}", range).replace("Range(\"", "").replace("\")", "");
+                println!("total_bytes: {}", total_bytes);
                 // Parse all satisfiable ranges
                 let satisfiable_ranges: Vec<_> = range
                     .satisfiable_ranges(total_bytes)
                     .map(|(start_bound, end_bound)| {
+                        println!("start_bound: {:?}, end_bound: {:?}", start_bound, end_bound);
                         let start = match start_bound {
                             Bound::Included(start) => start,
                             _ => 0,
@@ -170,6 +177,7 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
 
                         // Check if start position is valid
                         if start >= total_bytes {
+                            eprintln!("Start position {} exceeds total bytes {}", start, total_bytes);
                             return None;
                         }
 
@@ -181,6 +189,7 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                         };
                         // Check for invalid conditions
                         if start >= end {
+                            eprintln!("Start position {} is greater than or equal to end position {}", start, end);
                             return None;
                         }
 
@@ -204,8 +213,11 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?;
 
+                eprintln!("{} satisfiable_ranges", satisfiable_ranges.len());
                 if satisfiable_ranges.is_empty() {
+                    eprintln!("No satisfiable ranges found");
                     if range_str == "bytes=0-0" {
+                        eprintln!("bytes=0-0, returning zero-length range response");
                         // Special case for zero-length range request
                         let content_range = ContentRange::bytes(0..0, total_bytes)
                             .expect("ContentRange::bytes cannot panic in this usage");
@@ -230,12 +242,15 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                     } else {
                         if range_str.starts_with("bytes=") {
                             let bytes = range_str[6..].trim();
+                            println!("bytes: {}", bytes);
                             // If the range is like "bytes=-n", we can return the last n bytes
                             let n: i64 = bytes.parse().unwrap();
                             if n < 0 {
+                                eprintln!("Requested range is negative: {}, seeking from the end", n);
                                 // but that's ok, we can just return the whole file, or the block size
                                 // let n = total_bytes.wrapping_add(n as u64);
                                 if -n > total_bytes as i64 {
+                                    eprintln!("Requested range ({n}) exceeds total bytes, adjusting to total bytes ({total_bytes})");
                                     let content_range = ContentRange::bytes(0..total_bytes, total_bytes)
                                         .expect("ContentRange::bytes cannot panic in this usage");
                                     let content_length = ContentLength(total_bytes);
@@ -270,10 +285,12 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                         }
                     }
                     // TODO: try harder to match ranges that are RFC compliant
+                    eprintln!("No satisfiable ranges found");
                     return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
                 }
 
                 if satisfiable_ranges.len() == 1 {
+                    eprintln!("Single satisfiable range found: {:?}", satisfiable_ranges[0]);
                     // Single range response
                     let range = &satisfiable_ranges[0];
                     let content_range = ContentRange::bytes(range.start..range.end_exclusive, total_bytes)
