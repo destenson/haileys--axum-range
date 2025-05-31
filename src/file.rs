@@ -15,6 +15,14 @@ pub struct KnownSize<B: AsyncRead + AsyncSeekStart> {
     body: B,
 }
 
+impl std::fmt::Debug for KnownSize<tokio::fs::File> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KnownSize")
+            .field("byte_size", &self.byte_size)
+            .finish()
+    }
+}
+
 impl KnownSize<tokio::fs::File> {
     /// Calls [`tokio::fs::File::metadata`] to determine file size.
     pub async fn file(file: tokio::fs::File) -> io::Result<KnownSize<tokio::fs::File>> {

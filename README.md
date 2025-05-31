@@ -4,6 +4,8 @@ HTTP range responses for [`axum`][1].
 
 [Documentation][2].
 
+Implementation of the [HTTP Range Requests (RFC9110)][3] ([RFC7233][4]) specification for the [`axum`][1] web framework.
+
 MIT license.
 
 ### Example usage
@@ -27,3 +29,5 @@ async fn file(range: Option<TypedHeader<Range>>) -> Ranged<KnownSize<File>> {
 
 [1]: https://docs.rs/axum
 [2]: https://docs.rs/axum-range
+[3]: https://datatracker.ietf.org/doc/html/rfc9110#name-range-requests
+[4]: https://datatracker.ietf.org/doc/html/rfc7233
