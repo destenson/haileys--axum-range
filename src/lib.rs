@@ -727,11 +727,17 @@ mod rfc_compliance_tests {
     }
 
     async fn body(path: &str) -> KnownSize<File> {
+        // sleep for a random amount of time to ensure the file is created before reading
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Open the file and wrap it in KnownSize
         let file = File::open(path).await.unwrap();
         KnownSize::file(file).await.unwrap()
     }
 
     async fn body_blocks(path: &str, block_len: u64) -> KnownSize<File> {
+        // sleep for a random amount of time to ensure the file is created before reading
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Open the file and wrap it in KnownSize with specified block length
         let file = File::open(path).await.unwrap();
         KnownSize::file_blocks(file, block_len).await.unwrap()
     }
@@ -1020,7 +1026,7 @@ mod rfc_compliance_tests {
         // assert_eq!("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", &content);
         Ok(())
     }
-    
+
     #[tokio::test]
     async fn test_block_ranges() -> io::Result<()> {
         let test_path = setup().await?;
