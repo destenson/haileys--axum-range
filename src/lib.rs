@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! # axum-range
 //!
 //! HTTP range responses for [`axum`][1].
@@ -17,13 +18,14 @@
 //! use axum::routing::get;
 //! use axum_extra::{TypedHeader, headers::Range};
 //!
-//! use tokio::fs::File;
+//! use std::path::PathBuf;
+//! use std::str::FromStr;
 //!
 //! use axum_range::Ranged;
 //! use axum_range::KnownSize;
 //!
-//! async fn file(range: Option<TypedHeader<Range>>) -> Ranged<KnownSize<File>> {
-//!     let file = File::open("The Sims 1 - The Complete Collection.rar").await.unwrap();
+//! async fn file(range: Option<TypedHeader<Range>>) -> Ranged<KnownSize<tokio::fs::File>> {
+//! let file = PathBuf::from_str("document.txt").unwrap();
 //!     let body = KnownSize::file(file).await.unwrap();
 //!     let range = range.map(|TypedHeader(range)| range);
 //!     Ranged::new(range, body)
@@ -60,7 +62,7 @@ use axum_extra::headers::{ContentRange, ContentLength, AcceptRanges, HeaderValue
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use file::KnownSize;
-pub use stream::{RangedStream, MultipartStream};
+pub use stream::{RangedStream, MultipartStream, extract_boundary};
 
 /// [`AsyncSeek`] narrowed to only allow seeking from start.
 pub trait AsyncSeekStart {
@@ -118,13 +120,14 @@ impl ByteRange {
 pub struct Ranged<B: RangeBody + Send + 'static> {
     range: Option<Range>,
     body: B,
+    content_type: Option<String>,
 }
 
 impl<B: RangeBody + Send + 'static> Ranged<B> {
     /// Construct a ranged response over any type implementing [`RangeBody`]
     /// and an optional [`Range`] header.
-    pub fn new(range: Option<Range>, body: B) -> Self {
-        Ranged { range, body }
+    pub fn new(range: Option<Range>, body: B, content_type: Option<String>) -> Self {
+        Ranged { range, body, content_type }
     }
 
     /// Responds to the request, returning headers and body as
@@ -132,9 +135,13 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
     /// range in header was not satisfiable.
     pub fn try_respond(self) -> Result<RangedResponse<B>, RangeNotSatisfiable> {
         let total_bytes = self.body.byte_size();
+        if total_bytes == 0 {
+            println!("total bytes = 0!");
+            return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
+        }
 
         let block_len = self.body.block_len();
-        
+
         match self.range {
             None => {
                 if total_bytes <= block_len {
@@ -142,29 +149,102 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                     // no range header, return the whole file
                     let content_length = ContentLength(total_bytes);
                     let stream = RangedStream::new(self.body, 0, total_bytes);
+                    let content_type = self.content_type;
                     Ok(RangedResponse::Full {
                         content_length,
                         stream,
+                        content_type,
                     })
                 } else {
                     eprintln!("No range header, returning first {} bytes of file of size: {}", block_len, total_bytes);
                     // block_len is less than total_bytes, return the first block_len bytes
-                    let content_length = ContentLength(block_len);
+                    let content_length = ContentLength(total_bytes);
                     let stream = RangedStream::new(self.body, 0, block_len);
                     let content_range = ContentRange::bytes(0..block_len, total_bytes)
                         .expect("ContentRange::bytes cannot panic in this usage");
+                    let content_type = self.content_type;
                     Ok(RangedResponse::Single {
                         content_range,
                         content_length,
                         stream,
+                        content_type,
                     })
                 }
             }
             Some(range) => {
+                /*
+                   A byte-range-spec is invalid if the last-byte-pos value is present
+                   and less than the first-byte-pos.
+
+                   A client can limit the number of bytes requested without knowing the
+                   size of the selected representation.  If the last-byte-pos value is
+                   absent, or if the value is greater than or equal to the current
+                   length of the representation data, the byte range is interpreted as
+                   the remainder of the representation (i.e., the server replaces the
+                   value of last-byte-pos with a value that is one less than the current
+                   length of the selected representation).
+
+
+                   A client can request the last N bytes of the selected representation
+                   using a suffix-byte-range-spec.
+
+                     suffix-byte-range-spec = "-" suffix-length
+                     suffix-length = 1*DIGIT
+
+                   If the selected representation is shorter than the specified
+                   suffix-length, the entire representation is used.
+
+                   Additional examples, assuming a representation of length 10000:
+
+                   o  The final 500 bytes (byte offsets 9500-9999, inclusive):
+
+                        bytes=-500
+
+                   Or:
+
+                        bytes=9500-
+
+                   o  The first and last bytes only (bytes 0 and 9999):
+
+                        bytes=0-0,-1
+
+                   o  Other valid (but not canonical) specifications of the second 500
+                      bytes (byte offsets 500-999, inclusive):
+
+                        bytes=500-600,601-999
+                        bytes=500-700,601-999
+
+                */
+
                 println!("range: {:?}", range);
                 // hacky way to get the range string for parsing
                 let mut range_str = format!("{:?}", range).replace("Range(\"", "").replace("\")", "");
                 println!("total_bytes: {}", total_bytes);
+                let ranges = parse_range_header(&range_str, total_bytes)
+                    .map_err(|e| {
+                        eprintln!("Error parsing range header: {:?}", e);
+                        RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes))
+                    })?;
+                println!("Parsed ranges: {:?}", ranges);
+                // let parsed_ranges = parse_ranges(range_str.clone())
+                //     .map_err(|e|RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?;
+                // // count all the commas in the range string
+                let range_ct = range_str.as_str()
+                    .chars()
+                    .filter(|&c| c == ',')
+                    .count() + 1;
+                // if parsed_ranges.0.len() != range_ct {
+                //     eprintln!("Parsed ranges count {} does not match expected count {}", parsed_ranges.0.len(), range_ct);
+                //     return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
+                // }
+                /*
+                    Satisfiability:
+                    If a valid byte-range-set includes at least one byte-range-spec with
+                    a first-byte-pos that is less than the current length of the
+                    representation, or at least one suffix-byte-range-spec with a
+                    non-zero suffix-length, then the byte-range-set is satisfiable.
+                    Otherwise, the byte-range-set is unsatisfiable.
+                 */
                 // Parse all satisfiable ranges
                 let satisfiable_ranges: Vec<_> = range
                     .satisfiable_ranges(total_bytes)
@@ -213,7 +293,43 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?;
 
-                eprintln!("{} satisfiable_ranges", satisfiable_ranges.len());
+                eprintln!("{} satisfiable_ranges {} expected", satisfiable_ranges.len(), range_ct);
+                let satisfiable_ranges = if satisfiable_ranges.len() != range_ct {
+                    eprintln!("Number of satisfiable ranges does not match expected count");
+                    let range_strs = satisfiable_ranges.iter()
+                        .map(|r| format!("{}-{}", r.start, r.end_exclusive - 1))
+                        .collect::<Vec<_>>();
+                        // .join(",");
+                    eprintln!("Satisfiable ranges: {:?}", range_strs);
+                    // new range string with the satisfiable ranges removed, so we can process the rest
+                    let mut undetected_ranges = Vec::new();
+                    for range in satisfiable_ranges.iter() {
+                        if range_str.contains(&format!("{}-{}", range.start, range.end_exclusive - 1)) {
+                            println!("Removing found range {}-{} from range string", range.start, range.end_exclusive - 1);
+                            // remove the range from the string
+                            range_str = range_str.replace(&format!("{}-{}", range.start, range.end_exclusive - 1), "");
+                        } else {
+                            // if the range is not in the string, we can just add it to the new string
+                            undetected_ranges.push(format!("{},", range_str));
+                        }
+                    }
+                    range_str = if range_str.ends_with(',') {
+                        range_str[..range_str.len() - 1].to_string()
+                    } else {
+                        range_str
+                    };
+                    range_str = if range_str.starts_with(',') {
+                        range_str[1..].to_string()
+                    } else {
+                        range_str
+                    };
+                    println!("Undetected ranges: {} {}", undetected_ranges.join(","), range_str);
+                    satisfiable_ranges
+                } else {
+                    satisfiable_ranges
+                };
+
+                let content_type = self.content_type;
                 if satisfiable_ranges.is_empty() {
                     eprintln!("No satisfiable ranges found");
                     if range_str == "bytes=0-0" {
@@ -221,23 +337,25 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                         // Special case for zero-length range request
                         let content_range = ContentRange::bytes(0..0, total_bytes)
                             .expect("ContentRange::bytes cannot panic in this usage");
-                        let content_length = ContentLength(0);
+                        let content_length = ContentLength(total_bytes);
                         let stream = RangedStream::new(self.body, 0, 0);
                         return Ok(RangedResponse::Single {
                             content_range,
                             content_length,
                             stream,
+                            content_type,
                         });
                     } else if range_str == "bytes=0-" {
                         let start = total_bytes.saturating_sub(1);
                         let content_range = ContentRange::bytes(start..total_bytes, total_bytes)
                             .expect("ContentRange::bytes cannot panic in this usage");
-                        let content_length = ContentLength(total_bytes - start);
+                        let content_length = ContentLength(total_bytes);
                         let stream = RangedStream::new(self.body, start, total_bytes - start);
                         return Ok(RangedResponse::Single {
                             content_range,
                             content_length,
                             stream,
+                            content_type,
                         });
                     } else {
                         if range_str.starts_with("bytes=") {
@@ -259,6 +377,7 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                                         content_range,
                                         content_length,
                                         stream,
+                                        content_type,
                                     });
                                 } else {
                                     todo!();
@@ -295,14 +414,16 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                     let range = &satisfiable_ranges[0];
                     let content_range = ContentRange::bytes(range.start..range.end_exclusive, total_bytes)
                         .expect("ContentRange::bytes cannot panic in this usage");
-                    let content_length = ContentLength(range.len());
+                    let content_length = ContentLength(total_bytes);
                     let stream = RangedStream::new(self.body, range.start, range.len());
+                    eprintln!("Single satisfiable range found: {} / {}", range.len(), total_bytes);
 
-                    if content_range.bytes_len() == Some(content_length.0) {
+                    if Some(range.end_exclusive - range.start) == Some(content_length.0) {
                         // If the content length matches the range length, we can return 200 OK
                         Ok(RangedResponse::Full {
                             content_length,
                             stream,
+                            content_type,
                         })
                     } else {
                         // If the content length does not match, we return 206 Partial Content
@@ -310,16 +431,20 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                             content_range,
                             content_length,
                             stream,
+                            content_type,
                         })
                     }
                 } else {
                     // Multiple ranges response
                     let boundary = generate_boundary();
-                    let multipart_stream = MultipartStream::new(self.body, satisfiable_ranges, total_bytes, boundary.clone());
-
+                    let multipart_stream = MultipartStream::new(self.body, satisfiable_ranges, total_bytes, boundary.clone(), content_type.clone());
+                    
+                    let content_length = ContentLength(total_bytes);
                     Ok(RangedResponse::Multiple {
                         boundary,
                         stream: multipart_stream,
+                        content_length,
+                        content_type,
                     })
                 }
 
@@ -374,6 +499,357 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum ParseRangesError {
+    InvalidRange(String),
+    InvalidByteRange(String),
+    InvalidSuffixRange(String),
+}
+
+fn parse_ranges(range_str: String) -> Result<(Vec<(Bound<i64>, Bound<i64>)>, Option<Option<u64>>), ParseRangesError> {
+    // let mut ranges = Vec::new();
+    // let mut suffix_length = None;
+    let mut range_secs = range_str.trim().split("/");
+    if let Some(range_str) = range_secs.next() {
+        // If the range string is empty, return an error
+        if range_str.is_empty() {
+            return Err(ParseRangesError::InvalidRange(range_str.to_string()));
+        }
+        // TODO: parse the ranges string
+    } else {
+        return Err(ParseRangesError::InvalidRange(range_str.to_string()));
+    }
+    if let Some(exp_total_len) = range_secs.next() {
+        // If the expected total length is not a valid number, return an error
+        if let Ok(len) = exp_total_len.parse::<u64>() {
+            // If the length is zero, we can return an empty range
+            if len == 0 {
+                return Ok((Vec::new(), Some(None)));
+            }
+        } else {
+            return Err(ParseRangesError::InvalidRange(exp_total_len.to_string()));
+        }
+    } else {
+        // If there is no expected total length, the client does not know the total length
+    }
+    // let [be, len] = range_str.collect::<Vec<_>>()[..] else {
+    //     return Err(ParseRangesError::InvalidRange(range_str.to_string()));
+    // };
+    // for section in range_str {
+    //     if section.trim().is_empty() {
+    //         continue;
+    //     }
+    //     // If the section is not a valid range, return an error
+    //     if !section.starts_with("bytes=") && !section.starts_with("bytes=-") {
+    //         return Err(ParseRangesError::InvalidRange(section.to_string()));
+    //     }
+    // }
+    // for range in range_str.split(',') {
+    //     let range = range.trim();
+    //     if range.is_empty() {
+    //         continue;
+    //     }
+    //     if range.starts_with("bytes=") {
+    //         let bytes = &range[6..];
+    //         if bytes.contains('-') {
+    //             let parts: Vec<&str> = bytes.split('-').collect();
+    //             if parts.len() != 2 {
+    //                 return Err(ParseRangesError::InvalidRange(range.to_string()));
+    //             }
+    //             let start = parts[0].parse::<i64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?;
+    //             let end = parts[1].parse::<i64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?;
+    //             ranges.push((Bound::Included(start), Bound::Included(end)));
+    //         } else {
+    //             return Err(ParseRangesError::InvalidRange(range.to_string()));
+    //         }
+    //     } else if range.starts_with("bytes=-") {
+    //         let suffix_len = &range[7..];
+    //         let suffix_length_value = suffix_len.parse::<u64>().map_err(|_| ParseRangesError::InvalidSuffixRange(range.to_string()))?;
+    //         suffix_length = Some(Some(suffix_length_value));
+    //     } else {
+    //         return Err(ParseRangesError::InvalidRange(range.to_string()));
+    //     }
+    // }
+    // println!("Parsed ranges: {:?}", ranges);
+    // if ranges.is_empty() && suffix_length.is_none() {
+    //     return Err(ParseRangesError::InvalidRange(range_str));
+    // }
+    // Ok((ranges, suffix_length))
+    todo!();
+}
+
+trait RangeParser {
+    fn supported_ranges(&self) -> Vec<String>;
+}
+
+fn parse_range_header(range_header: &str, target_size: u64) -> Result<Vec<(Bound<u64>, Bound<u64>)>, ParseRangesError> {
+    println!("Parsing range header ({target_size}): {range_header}");
+    let end_index = target_size - 1;
+    if range_header.is_empty() {
+        return Ok(vec![(Bound::Included(0), Bound::Included(end_index))]);
+    }
+
+    let bytes_ = "bytes=";
+    if !range_header.starts_with(bytes_) {
+        eprintln!("Range header does not start with '{}'", bytes_);
+        return Err(ParseRangesError::InvalidRange(range_header.to_string()));
+    }
+
+    let mut ranges = Vec::new();
+    for range in range_header[bytes_.len()..].split(',') {
+        let split: Vec<&str> = range.split('-').collect();
+        match split.len() {
+            1 => {
+                println!("Single range: {}", split[0]);
+                match split[0].parse::<u64>() {
+                    Ok(start) => {
+                        if start > end_index {
+                            eprintln!("Start position {} exceeds end index {}", start, end_index);
+                            return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                        }
+                        ranges.push((Bound::Included(start), Bound::Included(end_index)));
+                    }
+                    Err(_) => {
+                        match split[0].parse::<i64>() {
+                            Ok(start) if start < 0 => {
+                                let start = end_index.saturating_sub((-start) as u64);
+                                ranges.push((Bound::Included(start), Bound::Unbounded));
+                            }
+                            _ => {
+                                eprintln!("Start position {} is not valid", split[0]);
+                                return Err(ParseRangesError::InvalidByteRange(range.to_string()))
+                            }
+                        }
+                    },
+                }
+                // let start = split[0].parse::<u64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?;
+                // ranges.push((Bound::Included(start), Bound::Included(end_index)));
+            }
+            2 => {
+                eprintln!("Range with start and end: '{}'-'{}'", split[0], split[1]);
+                let start = if split[0].is_empty() {
+                    println!("split[0] is empty");
+                    // parse ranges of the form "bytes=-100" (i.e., last 100 bytes)
+                    if split[1].is_empty() {
+                        eprintln!("Invalid range format: {}", range);
+                        return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                    } else {
+                        println!("Last bytes range: {}", split[1]);
+                        let split: Vec<&str> = split[1].split('/').collect();
+                        match split[0].parse::<u64>() {
+                            Ok(start) => {
+                                let end = end_index;
+                                // If the end is negative, we calculate the start position from the end index
+                                eprintln!("Start position: {start} (end index: {end_index})");
+                                let (start, end) = if start > end_index {
+                                    eprintln!("Start position {} exceeds end index {}", start, end_index);
+                                    return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                                } else {
+                                    (end_index.saturating_sub(start), end_index)
+                                };
+                                ranges.push((Bound::Included(start+1), Bound::Unbounded));
+                                continue;
+                            }
+                            _ => {
+                                eprintln!("End position {} is not valid", split[1]);
+                                return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                            }
+                        }
+                        // end_index.saturating_sub(split[1].parse::<u64>()
+                        //     .inspect_err(|e| eprintln!("Failed to parse end index from '{}': {}", split[1], e))
+                        //     .map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?)
+                    }
+                } else {
+                    split[0].parse::<u64>()
+                        .inspect_err(|e| eprintln!("Failed to parse start index from '{}': {}", split[0], e))
+                        .map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?
+                };
+                let end = if split[1].is_empty() {
+                    end_index
+                } else {
+                    if split[0].is_empty() {
+                        let s = format!("-{}", split[1]);
+                        let split = s.split("/").collect::<Vec<_>>();
+                        match split[0].parse::<i64>() {
+                            Ok(end) => {
+                                if -end > end_index as i64 {
+                                    end_index
+                                } else {
+                                    end_index - ((-end) as u64)
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Could not parse int: {} ; {}", split[0], range);
+                                return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                            }
+                        }
+                    } else {
+                        println!("Range with start and end: {}->{}", split[0], split[1]);
+                        println!("Last bytes range: {}", split[1]);
+                        let split: Vec<&str> = split[1].split('/').collect();
+                        match split[0].parse::<u64>() {
+                            Ok(end) => {
+                                // let end = end_index;
+                                // If the end is negative, we calculate the start position from the end index
+                                eprintln!("Start position: {start} (end index: {end_index})");
+                                let (start, end) = if start > end_index {
+                                    eprintln!("Start position {} exceeds end index {}", start, end_index);
+                                    return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                                } else {
+                                    (end_index.saturating_sub(start), end_index)
+                                };
+                                ranges.push((Bound::Included(start+1), Bound::Unbounded));
+                                continue;
+                            }
+                            _ => {
+                                eprintln!("End position {} is not valid", split[1]);
+                                return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                            }
+                        }
+                        // match split[1].parse::<u64>() {
+                        //     Ok(end) => end,
+                        //     Err(_) => {
+                        //         match split[1].parse::<i64>() {
+                        //             Ok(end) if end < 0 => end_index.saturating_sub((-end) as u64),
+                        //             _ => {
+                        //                 eprintln!("End position {} is not valid", split[1]);
+                        //                 return Err(ParseRangesError::InvalidByteRange(range.to_string()))
+                        //             },
+                        //         }
+                        //     }
+                        // }
+                        // split[1].parse::<u64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?
+                    }
+                };
+                if end < start {
+                    return Err(ParseRangesError::InvalidByteRange(range.to_string()));
+                }
+                ranges.push((Bound::Included(start), Bound::Included(end.min(end_index))));
+            }
+            _ => {
+                eprintln!("Invalid range format: {}", range);
+                return Err(ParseRangesError::InvalidRange(range.to_string()))
+            },
+        }
+    }
+
+    // merge the ranges
+    let mut merged: Vec<(Bound<u64>, Bound<u64>)> = vec![];
+    ranges.sort_by_key(|r| match r.0{
+        Bound::Included(start) => start,
+        Bound::Excluded(start) => start,
+        Bound::Unbounded => 0, // Unbounded should be treated as the lowest possible start
+    });
+    for range in ranges {
+        let start = match range.0 {
+            Bound::Included(start) => start,
+            Bound::Excluded(start) => start - 1,
+            Bound::Unbounded => 0, // Unbounded should be treated as the lowest possible start
+        };
+        let end_inc = match range.1 {
+            Bound::Included(end) => end,
+            Bound::Excluded(end) => end - 1,
+            Bound::Unbounded => end_index, // Unbounded should be treated as the highest possible end
+        };
+        if merged.is_empty() {
+            merged.push((Bound::Included(start), Bound::Included(end_inc)));
+            continue;
+        }
+        match &mut merged.last_mut().unwrap().1 {
+            Bound::Included(last_end) if &start > last_end => {
+                merged.push((Bound::Included(start), Bound::Included(end_inc)));
+            }
+            Bound::Included(last_end) => {
+                // If the start is less than or equal to the last end, we merge the ranges
+                *last_end = *(&*last_end).max(&end_inc);
+            }
+            Bound::Excluded(last_end) if &start >= last_end => {
+                merged.push((Bound::Included(start), Bound::Included(end_inc)));
+            }
+            Bound::Excluded(last_end) => {
+                // If the start is less than or equal to the last end, we merge the ranges
+                *last_end = (*last_end).max(end_inc + 1);
+            }
+            Bound::Unbounded => break, // Unbounded end means we've already merge all possible rangesz
+        }
+    }
+
+    Ok(merged)
+}
+
+#[test]
+fn test_parse_range_header() {
+    let tests = [
+        ("bytes=0-100", 200, Ok(vec![(Bound::Included(0), Bound::Included(100))])),
+        ("bytes=0-100,200-300", 500, Ok(vec![
+            (Bound::Included(0), Bound::Included(100)),
+            (Bound::Included(200), Bound::Included(300))
+        ])),
+        ("bytes=0-", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
+        ("bytes=-100", 500, Ok(vec![(Bound::Included(400), Bound::Included(499))])),
+        ("bytes=100-", 500, Ok(vec![(Bound::Included(100), Bound::Included(499))])),
+        ("bytes=100-200", 500, Ok(vec![(Bound::Included(100), Bound::Included(200))])),
+        ("bytes=100-200,300-400", 500, Ok(vec![
+            (Bound::Included(100), Bound::Included(200)),
+            (Bound::Included(300), Bound::Included(400))
+        ])),
+        ("bytes=-1", 500, Ok(vec![(Bound::Included(499), Bound::Included(499))])),
+        ("bytes=0-0", 500, Ok(vec![(Bound::Included(0), Bound::Included(0))])),
+        ("bytes=0-0,-1", 500, Ok(vec![
+            (Bound::Included(0), Bound::Included(0)),
+            (Bound::Included(499), Bound::Included(499))
+        ])),
+        ("bytes=0-4,-1", 500, Ok(vec![
+            (Bound::Included(0), Bound::Included(4)),
+            (Bound::Included(499), Bound::Included(499))
+        ])),
+        ("bytes=0-4,-1/*", 500, Ok(vec![
+            (Bound::Included(0), Bound::Included(4)),
+            (Bound::Included(499), Bound::Included(499))
+        ])),
+        ("bytes=0-24646", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
+        ("bytes=0-24646/*", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
+        ("bytes=0-24646", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
+        ("bytes=0-24646/25000", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
+        ("none", 500, Err(ParseRangesError::InvalidRange("none".to_string()))),
+        ("bleets=100-324", 500, Err(ParseRangesError::InvalidRange("bleets=100-324".to_string()))),
+        ("bytes=0-24646,100-200", 500, Ok(vec![
+            (Bound::Included(0), Bound::Included(499))
+        ])),
+        ("bytes=0-24646,100-200,300-400", 500, Ok(vec![
+            (Bound::Included(0), Bound::Included(499)),
+        ])),
+    ];
+
+    for (i, (range_header, target_size, expected)) in tests.iter().enumerate() {
+        let result = parse_range_header(range_header, *target_size);
+        assert_eq!(result, *expected, "Failed to parse range header #{i}: {}\n{:?}", range_header, tests[i]);
+    }
+}
+
+#[test]
+fn test_parse_ranges() {
+    let range_str = "bytes=0-100,200-300,400-500".to_string();
+    println!("Ranges to parse: {}", range_str);
+    let (ranges, suffix_length) = parse_ranges(range_str).unwrap();
+    assert_eq!(ranges.len(), 3);
+    assert_eq!(suffix_length, None);
+    assert_eq!(ranges[0], (Bound::Included(0), Bound::Included(101)));
+    assert_eq!(ranges[1], (Bound::Included(200), Bound::Included(301)));
+    assert_eq!(ranges[2], (Bound::Included(400), Bound::Included(501)));
+
+    let range_str = "bytes=-100".to_string();
+    let (ranges, suffix_length) = parse_ranges(range_str).unwrap();
+    assert_eq!(ranges.len(), 0);
+    assert_eq!(suffix_length, Some(Some(100)));
+
+    let range_str = "bytes=0-100".to_string();
+    let (ranges, suffix_length) = parse_ranges(range_str).unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(suffix_length, None);
+    assert_eq!(ranges[0], (Bound::Included(0), Bound::Included(101)));
+}
+
 impl<B: RangeBody + Send + 'static> IntoResponse for Ranged<B> {
     fn into_response(self) -> Response {
         self.try_respond().into_response()
@@ -392,23 +868,27 @@ impl IntoResponse for RangeNotSatisfiable {
     }
 }
 
+#[derive(Debug)]
 /// Data type containing computed headers and body for a range response. Implements [`IntoResponse`].
 pub enum RangedResponse<B> {
     /// Full content response, no range requested.
     Full {
         content_length: ContentLength,
         stream: RangedStream<B>,
+        content_type: Option<String>,
     },
     Single {
         content_range: ContentRange,
         content_length: ContentLength,
         stream: RangedStream<B>,
+        content_type: Option<String>,
     },
     Multiple {
         // content_ranges: Vec<ContentRange>,
-        // content_length: ContentLength,
         stream: MultipartStream<B>,
         boundary: String,
+        content_length: ContentLength,
+        content_type: Option<String>,
     }
     // pub content_range: Option<ContentRange>,
     // pub content_length: ContentLength,
@@ -423,15 +903,16 @@ impl<B: RangeBody + Send + 'static> IntoResponse for RangedResponse<B> {
 
         use RangedResponse::*;
         match self {
-            Full { content_length, stream } => {
+            Full { content_length, stream, content_type } => {
                 // headers.push(("Content-Length", content_length.0.into()));
                 let headers = [
                     ("Accept-Ranges", HeaderValue::from_static("bytes")),
-                    ("Content-Length", content_length.0.into())
+                    ("Content-Length", content_length.0.into()),
+                    ("Content-Type", HeaderValue::from_str(&content_type.unwrap_or_else(|| "application/octet-stream".to_string())).unwrap())
                 ];
                 (StatusCode::OK, headers, stream).into_response()
             }
-            Single { content_range, content_length, stream } => {
+            Single { content_range, content_length, stream, content_type } => {
                 // headers.insert("Content-Range", TypedHeader(content_range).into());
                 // headers.insert("Content-Length", content_length.0.into());
                 let range = content_range
@@ -442,25 +923,26 @@ impl<B: RangeBody + Send + 'static> IntoResponse for RangedResponse<B> {
                 let headers = [
                     ("Accept-Ranges", HeaderValue::from_static("bytes")),
                     ("Content-Range", HeaderValue::from_str(&range).unwrap()),
-                    ("Content-Length", content_length.0.into())
+                    // ("Content-Length", content_length.0.into()), // this causes problems if included
+                    ("Content-Type", HeaderValue::from_str(&content_type.unwrap_or_else(|| "application/octet-stream".to_string())).unwrap())
                 ];
                 if content_length.0 == 0 {
                     // If the content length is zero, we should return 204 No Content
                     (StatusCode::NO_CONTENT, headers, stream).into_response()
-                } else if Some(content_length.0) != content_range.bytes_len() {
+                } else if Some(content_length.0) != content_range.bytes_range().map(|(start, end)| end-start) {
                     (StatusCode::PARTIAL_CONTENT, headers, stream).into_response()
                 } else {
                     (StatusCode::OK, headers, stream).into_response()
                 }
             }
-            Multiple { /*content_ranges, content_length,*/ stream, boundary } => {
+            Multiple { /*content_ranges, content_length,*/ stream, boundary, content_type, content_length } => {
                 // headers.insert("Content-Type", HeaderValue::from_str(&format!("multipart/byteranges; boundary={}", boundary)).unwrap());
                 // headers.insert("Content-Length", content_length.0.into());
 
                 let headers = [
                     ("Accept-Ranges", HeaderValue::from_static("bytes")),
                     ("Content-Type", HeaderValue::from_str(&format!("multipart/byteranges; boundary={}", boundary)).unwrap()),
-                    // ("Content-Length", content_length.0.into())
+                    ("Content-Length", content_length.0.into())
                 ];
 
                 (StatusCode::PARTIAL_CONTENT, headers, stream).into_response()
@@ -494,6 +976,8 @@ fn generate_boundary() -> String {
 mod tests {
     use super::*;
     use std::io;
+    use std::path::PathBuf;
+    use std::str::FromStr;
     use axum::body::Body;
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::IntoResponse;
@@ -529,13 +1013,13 @@ mod tests {
     }
 
     async fn body() -> KnownSize<File> {
-        let file = File::open("test/fixture.txt").await.unwrap();
+        let file = PathBuf::from_str("test/fixture.txt").unwrap();
         KnownSize::file(file).await.unwrap()
     }
 
     #[tokio::test]
     async fn test_full_response() {
-        let ranged = Ranged::new(None, body().await);
+        let ranged = Ranged::new(None, body().await, None);
 
         let r = ranged.try_respond().expect("try_respond should return Ok");
         let body = {
@@ -558,13 +1042,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_response_1() {
-        let ranged = Ranged::new(range("bytes=0-29"), body().await);
+        let ranged = Ranged::new(range("bytes=0-29"), body().await, None);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(30), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(54), content_length);
                 assert_eq!(ContentRange::bytes(0..30, 54).unwrap(), content_range);
                 assert_eq!("Hello world this is a file to ", &collect_stream(stream).await);
             }
@@ -574,13 +1058,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_response_2() {
-        let ranged = Ranged::new(range("bytes=30-53"), body().await);
+        let ranged = Ranged::new(range("bytes=30-53"), body().await, None);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(24), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                println!("content-type: {:?}", content_type);
+                assert_eq!(ContentLength(54), content_length);
                 assert_eq!(ContentRange::bytes(30..54, 54).unwrap(), content_range);
                 assert_eq!("test range requests on!\n", &collect_stream(stream).await);
             }
@@ -592,13 +1077,13 @@ mod tests {
     async fn test_unbounded_start_response() {
         // unbounded ranges in HTTP are actually a suffix
 
-        let ranged = Ranged::new(range("bytes=-20"), body().await);
+        let ranged = Ranged::new(range("bytes=-20"), body().await, None);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(20), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(54), content_length);
                 assert_eq!(ContentRange::bytes(34..54, 54).unwrap(), content_range);
                 assert_eq!(" range requests on!\n", &collect_stream(stream).await);
             }
@@ -608,13 +1093,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_unbounded_end_response() {
-        let ranged = Ranged::new(range("bytes=40-"), body().await);
+        let ranged = Ranged::new(range("bytes=40-"), body().await, None);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(14), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(54), content_length);
                 assert_eq!(ContentRange::bytes(40..54, 54).unwrap(), content_range);
                 assert_eq!(" requests on!\n", &collect_stream(stream).await);
             }
@@ -624,13 +1109,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_one_byte_response() {
-        let ranged = Ranged::new(range("bytes=30-30"), body().await);
+        let ranged = Ranged::new(range("bytes=30-30"), body().await, None);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(1), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(54), content_length);
                 assert_eq!(ContentRange::bytes(30..31, 54).unwrap(), content_range);
                 assert_eq!("t", &collect_stream(stream).await);
             }
@@ -640,7 +1125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_range() {
-        let ranged = Ranged::new(range("bytes=30-29"), body().await);
+        let ranged = Ranged::new(range("bytes=30-29"), body().await, None);
 
         let err = ranged.try_respond().err().expect("try_respond should return Err");
 
@@ -650,13 +1135,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_range_end_exceed_length() {
-        let ranged = Ranged::new(range("bytes=30-99"), body().await);
+        let ranged = Ranged::new(range("bytes=30-99"), body().await, None);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(24), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(54), content_length);
                 assert_eq!(ContentRange::bytes(30..54, 54).unwrap(), content_range);
                 assert_eq!("test range requests on!\n", &collect_stream(stream).await);
             }
@@ -666,7 +1151,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_range_start_exceed_length() {
-        let ranged = Ranged::new(range("bytes=99-"), body().await);
+        let ranged = Ranged::new(range("bytes=99-"), body().await, None);
 
         let err = ranged.try_respond().err().expect("try_respond should return Err");
 
@@ -678,6 +1163,8 @@ mod tests {
 #[cfg(test)]
 mod rfc_compliance_tests {
     use std::io;
+    use std::path::PathBuf;
+    use std::str::FromStr;
     use bytes::Bytes;
     use futures::{pin_mut, Stream, StreamExt};
     use axum::http::{HeaderValue, StatusCode};
@@ -688,7 +1175,7 @@ mod rfc_compliance_tests {
     use crate::{Ranged, KnownSize, RangedResponse, RangeNotSatisfiable, stream};
 
     // Utility functions for tests
-    async fn collect_stream(stream: impl Stream<Item = io::Result<Bytes>>) -> String {
+    async fn collect_stream(stream: impl Stream<Item=io::Result<Bytes>>) -> String {
         let mut string = String::new();
         pin_mut!(stream);
         while let Some(chunk) = stream.next().await.transpose().unwrap() {
@@ -697,7 +1184,7 @@ mod rfc_compliance_tests {
         string
     }
 
-    async fn collect_multipart_stream(stream: impl Stream<Item = io::Result<Bytes>>, boundary: &str) -> String {
+    async fn collect_multipart_stream(stream: impl Stream<Item=io::Result<Bytes>>, boundary: &str) -> String {
         let mut content = String::new();
         let mut buffer = String::new();
         let full_boundary = format!("--{}", boundary);
@@ -743,11 +1230,12 @@ mod rfc_compliance_tests {
         Ok(())
     }
 
+    // sleep for a random amount of time to ensure the file is created before reading
     async fn body(path: &str) -> KnownSize<File> {
-        // sleep for a random amount of time to ensure the file is created before reading
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // Open the file and wrap it in KnownSize
         let file = File::open(path).await.unwrap();
+        let file = PathBuf::from_str(path).unwrap();
         KnownSize::file(file).await.unwrap()
     }
 
@@ -755,8 +1243,8 @@ mod rfc_compliance_tests {
         // sleep for a random amount of time to ensure the file is created before reading
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // Open the file and wrap it in KnownSize with specified block length
-        let file = File::open(path).await.unwrap();
-        KnownSize::file_blocks(file, block_len).await.unwrap()
+        // let file = File::open(path).await.unwrap();
+        KnownSize::file_blocks(path, block_len).await.unwrap()
     }
 
     // Test setup that creates a test file with known content
@@ -771,11 +1259,11 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_full_response() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(None, body(&test_path).await);
+        let ranged = Ranged::new(None, body(&test_path).await, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Full { content_length, stream } => {
+            RangedResponse::Full { content_length, stream, content_type } => {
                 assert_eq!(ContentLength(62), content_length);
                 // assert_eq!(ContentRange::bytes(0..62, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
@@ -790,12 +1278,12 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_single_byte_range() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=0-9"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=0-9"), body(&test_path).await, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(10), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(62), content_length);
                 assert_eq!(ContentRange::bytes(0..10, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
                 assert_eq!("0123456789", &content);
@@ -816,12 +1304,12 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_end_exceeds_length() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=50-999"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=50-999"), body(&test_path).await, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(12), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(62), content_length);
                 assert_eq!(ContentRange::bytes(50..62, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
                 assert_eq!("opqrstuvwxyz", &content);
@@ -841,7 +1329,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_start_exceeds_length() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=100-"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=100-"), body(&test_path).await, None);
         let result = ranged.try_respond();
 
         assert!(result.is_err());
@@ -855,12 +1343,12 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_suffix_range() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=-10"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=-10"), body(&test_path).await, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(10), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(62), content_length);
                 assert_eq!(ContentRange::bytes(52..62, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
                 assert_eq!("qrstuvwxyz", &content);
@@ -881,11 +1369,11 @@ mod rfc_compliance_tests {
     async fn test_suffix_range_exceeds_length() -> io::Result<()> {
         let test_path = setup().await?;
         let body = body(&test_path).await;
-        let ranged = Ranged::new(range("bytes=-100"), body);
+        let ranged = Ranged::new(range("bytes=-100"), body, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
                 assert_eq!(ContentLength(62), content_length);
                 assert_eq!(ContentRange::bytes(0..62, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
@@ -906,7 +1394,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_start_greater_than_end() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=30-20"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=30-20"), body(&test_path).await, None);
         let result = ranged.try_respond();
 
         assert!(result.is_err());
@@ -920,7 +1408,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_first_and_last_byte() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=0-0,-1"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=0-0,-1"), body(&test_path).await, None);
 
         println!("Testing first and last byte range : ranged={:?}", ranged);
 
@@ -929,7 +1417,7 @@ mod rfc_compliance_tests {
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Multiple { stream, boundary } => {
+            RangedResponse::Multiple { stream, boundary, content_type, content_length } => {
                 assert_eq!("RANGE_BOUNDARY-", &boundary[..15]);
                 let content = collect_multipart_stream(stream, &boundary).await;
                 assert_eq!("0z", &content); // First byte is '0', last byte is 'z'
@@ -951,12 +1439,12 @@ mod rfc_compliance_tests {
     async fn test_multiple_ranges() -> io::Result<()> {
         let test_path = setup().await?;
         let body = body(&test_path).await;
-        let ranged = Ranged::new(range("bytes=0-9,20-29,40-49"), body);
+        let ranged = Ranged::new(range("bytes=0-9,20-29,40-49"), body, None);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Multiple { stream, boundary } => {
+            RangedResponse::Multiple { stream, boundary, content_type, content_length } => {
                 // For now we only support the first range, so we expect a single range response
                 assert!(boundary.starts_with("RANGE_BOUNDARY-"));
                 let content = collect_multipart_stream(stream, &boundary).await;
@@ -978,7 +1466,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_zero_length_range() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=10-9"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=10-9"), body(&test_path).await, None);
         let result = ranged.try_respond();
 
         assert!(result.is_err());
@@ -992,12 +1480,12 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_only_start() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=50-"), body(&test_path).await);
+        let ranged = Ranged::new(range("bytes=50-"), body(&test_path).await, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(12), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(62), content_length);
                 assert_eq!(ContentRange::bytes(50..62, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
                 assert_eq!("opqrstuvwxyz", &content);
@@ -1019,19 +1507,19 @@ mod rfc_compliance_tests {
         let test_path = setup().await?;
         let body = body(&test_path).await;
         // This wouldn't parse as a valid Range header, so we'd get None
-        let ranged = Ranged::new(None, body);
+        let ranged = Ranged::new(None, body, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Full { content_length, stream } => {
+            RangedResponse::Full { content_length, stream, content_type } => {
                 assert_eq!(ContentLength(62), content_length);
                 let content = collect_stream(stream).await;
                 assert_eq!("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", &content);
             }
-            RangedResponse::Single { content_range, content_length, stream } => {
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
                 panic!("Expected a full response, got single range response");
             }
-            RangedResponse::Multiple { stream, boundary } => {
+            RangedResponse::Multiple { stream, boundary, content_type, content_length } => {
                 panic!("Expected a full response, got multiple ranges response");
             }
             // _ => panic!("Expected a full response"),
@@ -1051,12 +1539,12 @@ mod rfc_compliance_tests {
         let body = body_blocks(&test_path, block_size).await;
 
         // Test with block size of 10
-        let ranged = Ranged::new(range("bytes=0-29"), body);
+        let ranged = Ranged::new(range("bytes=0-29"), body, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(10), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(62), content_length);
                 assert_eq!(ContentRange::bytes(0..10, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
                 assert_eq!("0123456789", &content);
@@ -1074,12 +1562,12 @@ mod rfc_compliance_tests {
         let body = body_blocks(&test_path, block_size).await;
 
         // Test with block size of 10
-        let ranged = Ranged::new(range("bytes=10-29"), body);
+        let ranged = Ranged::new(range("bytes=10-29"), body, None);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
-            RangedResponse::Single { content_range, content_length, stream } => {
-                assert_eq!(ContentLength(10), content_length);
+            RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                assert_eq!(ContentLength(62), content_length);
                 assert_eq!(ContentRange::bytes(10..20, 62).unwrap(), content_range);
                 let content = collect_stream(stream).await;
                 assert_eq!("ABCDEFGHIJ", &content);
@@ -1088,6 +1576,70 @@ mod rfc_compliance_tests {
         }
 
         Ok(())
+    }
+
+    mod examples_from_rfc7233 {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_first_500_bytes() {
+            let file_length = std::fs::metadata("Cargo.lock").unwrap().len();
+            let body = body("Cargo.lock").await;
+            let ranged = Ranged::new(range("bytes=0-499"), body, None);
+            let response = ranged.try_respond().expect("try_respond should return Ok");
+            match response {
+                RangedResponse::Single { content_range, content_length, stream, content_type } => {
+                    assert_eq!(ContentLength(file_length), content_length);
+                    assert_eq!(ContentRange::bytes(0..500, file_length).unwrap(), content_range);
+                    let content = collect_stream(stream).await;
+                    // Here you would check the first 500 bytes of the file
+                    // assert_eq!(expected_content, &content);
+                }
+                _ => panic!("Expected a single range response: {:?}", response),
+            }
+        }
+
+        /*
+           Examples of byte-ranges-specifier values:
+
+           o  The first 500 bytes (byte offsets 0-499, inclusive):
+
+                bytes=0-499
+
+           o  The second 500 bytes (byte offsets 500-999, inclusive):
+
+                bytes=500-999
+
+           A client can request the last N bytes of the selected representation
+           using a suffix-byte-range-spec.
+
+             suffix-byte-range-spec = "-" suffix-length
+             suffix-length = 1*DIGIT
+
+           If the selected representation is shorter than the specified
+           suffix-length, the entire representation is used.
+
+           Additional examples, assuming a representation of length 10000:
+
+           o  The final 500 bytes (byte offsets 9500-9999, inclusive):
+
+                bytes=-500
+
+           Or:
+
+                bytes=9500-
+
+           o  The first and last bytes only (bytes 0 and 9999):
+
+                bytes=0-0,-1
+
+           o  Other valid (but not canonical) specifications of the second 500
+              bytes (byte offsets 500-999, inclusive):
+
+                bytes=500-600,601-999
+                bytes=500-700,601-999
+
+         */
     }
 }
 

@@ -1,13 +1,14 @@
 use std::{io, mem};
+use std::io::{BufWriter, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::response::{Response, IntoResponse};
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, SizeHint, Frame};
-use futures::Stream;
+use futures::{FutureExt, Stream};
 use pin_project::pin_project;
-use tokio::io::ReadBuf;
+use tokio::io::{AsyncReadExt, BufReader, ReadBuf};
 
 use crate::{RangeBody, ByteRange};
 
@@ -15,6 +16,7 @@ const IO_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Response body stream. Implements [`Stream`], [`Body`], and [`IntoResponse`].
 #[pin_project]
+#[derive(Debug)]
 pub struct RangedStream<B> {
     state: StreamState,
     length: u64,
@@ -138,27 +140,31 @@ impl<B: RangeBody> Stream for RangedStream<B> {
 /// Multipart response body stream for multiple byte ranges.
 /// Implements [`Stream`], [`Body`], and [`IntoResponse`].
 #[pin_project]
+#[derive(Debug)]
 pub struct MultipartStream<B> {
     state: MultipartState,
     ranges: Vec<ByteRange>,
     current_range_index: usize,
     total_size: u64,
     boundary: String,
+    content_type: Option<String>,
     #[pin]
     body: B,
 }
 
 impl<B: RangeBody + Send + 'static> MultipartStream<B> {
-    pub(crate) fn new(body: B, ranges: Vec<ByteRange>, total_size: u64, boundary: String) -> Self {
+    pub(crate) fn new(body: B, ranges: Vec<ByteRange>, total_size: u64, boundary: String, content_type: Option<String>) -> Self {
         MultipartStream {
             state: MultipartState::WritingBoundary { first: true },
             ranges,
             current_range_index: 0,
             total_size,
             boundary,
+            content_type,
             body,
         }
     }
+
 }
 
 #[derive(Debug)]
@@ -226,8 +232,9 @@ impl<B: RangeBody> Stream for MultipartStream<B> {
                 MultipartState::WritingHeaders => {
                     let range = &this.ranges[*this.current_range_index];
                     let headers = format!(
-                        "Content-Type: application/octet-stream\r\n\
+                        "Content-Type: {}\r\n\
                          Content-Range: bytes {}-{}/{}\r\n\r\n",
+                        this.content_type.clone().unwrap_or_else(||"application/octet-stream".to_string()),
                         range.start,
                         range.end_exclusive - 1, // HTTP ranges are inclusive
                         this.total_size
@@ -321,3 +328,97 @@ impl<B: RangeBody> Stream for MultipartStream<B> {
 fn allocate_buffer() -> BytesMut {
     BytesMut::with_capacity(IO_BUFFER_SIZE)
 }
+
+
+#[derive(Debug)]
+pub struct RangePart {
+    pub content_range: Option<String>,
+    pub data: Bytes,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum ExtractBoundaryError {
+    InvalidContentType,
+}
+
+pub fn extract_boundary(content_type: &str) -> Result<String, ExtractBoundaryError> {
+    use ExtractBoundaryError::*;
+    // Parse "multipart/byteranges; boundary=something"
+    let boundary_prefix = "boundary=";
+    content_type
+        .split(';')
+        .find_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.starts_with(boundary_prefix) {
+                Some(trimmed[boundary_prefix.len()..].trim_matches('"').to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or(InvalidContentType)
+}
+
+use multer::Multipart;
+
+// pub async fn parse_multipart_response(
+//     body: Bytes,
+//     boundary: &str
+// ) -> Result<Vec<(String, Bytes)>, multer::Error> {
+//     use std::convert::Infallible;
+// 
+//     use bytes::Bytes;
+//     use futures_util::stream::once;
+//     use multer::Multipart;
+//     
+//     let stream = once(async move { Result::<Bytes, Infallible>::Ok(body) });
+//     let mut multipart = Multipart::new(stream, boundary);
+// 
+//     let mut result = vec![];
+//     while let Some(field) = multipart.next_field().await.unwrap() {
+//         let content_type = field.headers().get("content-type")
+//             .and_then(|v| v.to_str().ok())
+//             .unwrap_or("unknown")
+//             .to_string();
+//         println!("Content-Type: {}", content_type);
+//         let headers = field.headers().clone();
+//         println!("Headers: {:?}", headers);
+//         let r = field.bytes().await.unwrap();
+//         result.push((content_type, r));
+//         // println!("Field: {:?}", field.text().await)
+//     }
+//     Ok(result)
+// 
+//     // use tokio::io::{AsyncRead, AsyncBufRead, AsyncBufReadExt};
+//     //
+//     // // // use futures::stream;
+//     // // let body = async_stream::IntoStream::from(async move {
+//     // //     let reader = BufReader::new(body);
+//     // //     let mut buf_writer = BufWriter::new(Vec::new());
+//     // //     buf_writer.write_all(reader.get_ref()).await?;
+//     // //     buf_writer.flush().await?;
+//     // //     Ok::<_, std::io::Error>(buf_writer.into_inner())
+//     // // });
+//     // // let body = stream::once(async { Ok::<_, std::io::Error>(body) });
+//     // let mut multipart = Multipart::new(
+//     //     async_stream::stream! {
+//     //         yield Ok::<_, std::io::Error>(body);
+//     //     }, boundary);
+//     // let mut parts = Vec::new();
+//     //
+//     // while let Some(mut field) = multipart.next_field().await.inspect_err(|e| eprintln!("next field error: {:?}", e))? {
+//     //     let headers = field.headers().clone();
+//     //     println!("Headers: {:?}", headers);
+//     //     let data = field.bytes().await.inspect_err(|e| eprintln!("field bytes error: {:?}", e))?;
+//     //
+//     //     // Extract Content-Range header if present
+//     //     let content_range = headers
+//     //         .get("content-range")
+//     //         .and_then(|v| v.to_str().ok())
+//     //         .unwrap_or("unknown")
+//     //         .to_string();
+//     //
+//     //     parts.push((content_range, data));
+//     // }
+//     //
+//     // Ok(parts)
+// }
