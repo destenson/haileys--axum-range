@@ -25,7 +25,7 @@
 //! async fn file(request: RangeRequest) -> Ranged<KnownSize<tokio::fs::File>> {
 //!     let file = PathBuf::from_str("document.txt").unwrap();
 //!     let body = KnownSize::file(file).await.unwrap();
-//!     Ranged::from_request(request, body, None)
+//!     Ranged::from_request(request, body)
 //! }
 //!
 //! #[tokio::main]
@@ -100,6 +100,10 @@ pub trait RangeBody: AsyncRead + AsyncSeekStart {
     /// This is used to determine how much data to read for a range request.
     /// If not specified, the entire byte size is used.
     fn block_len(&self) -> u64 { self.byte_size() }
+
+    /// The media type of the body, sent as `Content-Type` (and in each part
+    /// of a multipart response). `application/octet-stream` if `None`.
+    fn content_type(&self) -> Option<String> { None }
 }
 
 /// Represents a single byte range with start and end positions (exclusive end).
@@ -180,18 +184,26 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
     /// The caller is responsible for only passing a `Range` received on a GET
     /// request; [`Ranged::from_request`] handles that, and also handles
     /// `If-Range` and range units other than `bytes`.
-    pub fn new(range: Option<Range>, body: B, content_type: Option<String>) -> Self {
+    pub fn new(range: Option<Range>, body: B) -> Self {
         let range = range.and_then(|range| {
             let mut values = Vec::new();
             range.encode(&mut values);
             values.into_iter().next()
         });
-        Self::from_request(RangeRequest { range, if_range: None }, body, content_type)
+        Self::from_request(RangeRequest { range, if_range: None }, body)
     }
 
     /// Construct a ranged response for the request described by `request`.
-    pub fn from_request(request: RangeRequest, body: B, content_type: Option<String>) -> Self {
+    pub fn from_request(request: RangeRequest, body: B) -> Self {
+        let content_type = body.content_type();
         Ranged { request, etag: None, last_modified: None, body, content_type }
+    }
+
+    /// The media type to send as `Content-Type`, overriding
+    /// [`RangeBody::content_type`].
+    pub fn with_content_type(mut self, content_type: String) -> Self {
+        self.content_type = Some(content_type);
+        self
     }
 
     /// The current entity-tag of the representation, which an `If-Range`
@@ -745,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_response() {
-        let ranged = Ranged::new(None, body().await, None);
+        let ranged = Ranged::new(None, body().await);
 
         let r = ranged.try_respond().expect("try_respond should return Ok");
         let body = {
@@ -768,7 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_response_1() {
-        let ranged = Ranged::new(range("bytes=0-29"), body().await, None);
+        let ranged = Ranged::new(range("bytes=0-29"), body().await);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
@@ -784,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_response_2() {
-        let ranged = Ranged::new(range("bytes=30-53"), body().await, None);
+        let ranged = Ranged::new(range("bytes=30-53"), body().await);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
@@ -803,7 +815,7 @@ mod tests {
     async fn test_unbounded_start_response() {
         // unbounded ranges in HTTP are actually a suffix
 
-        let ranged = Ranged::new(range("bytes=-20"), body().await, None);
+        let ranged = Ranged::new(range("bytes=-20"), body().await);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
@@ -819,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unbounded_end_response() {
-        let ranged = Ranged::new(range("bytes=40-"), body().await, None);
+        let ranged = Ranged::new(range("bytes=40-"), body().await);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
@@ -835,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_one_byte_response() {
-        let ranged = Ranged::new(range("bytes=30-30"), body().await, None);
+        let ranged = Ranged::new(range("bytes=30-30"), body().await);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
@@ -851,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_range() {
-        let ranged = Ranged::new(range("bytes=30-29"), body().await, None);
+        let ranged = Ranged::new(range("bytes=30-29"), body().await);
 
         let err = ranged.try_respond().err().expect("try_respond should return Err");
 
@@ -861,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_range_end_exceed_length() {
-        let ranged = Ranged::new(range("bytes=30-99"), body().await, None);
+        let ranged = Ranged::new(range("bytes=30-99"), body().await);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
@@ -877,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_range_start_exceed_length() {
-        let ranged = Ranged::new(range("bytes=99-"), body().await, None);
+        let ranged = Ranged::new(range("bytes=99-"), body().await);
 
         let err = ranged.try_respond().err().expect("try_respond should return Err");
 
@@ -972,7 +984,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_full_response() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(None, body(&test_path).await, None);
+        let ranged = Ranged::new(None, body(&test_path).await);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -991,7 +1003,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_single_byte_range() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=0-9"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=0-9"), body(&test_path).await);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1017,7 +1029,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_end_exceeds_length() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=50-999"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=50-999"), body(&test_path).await);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1042,7 +1054,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_start_exceeds_length() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=100-"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=100-"), body(&test_path).await);
         let result = ranged.try_respond();
 
         assert!(result.is_err());
@@ -1056,7 +1068,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_suffix_range() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=-10"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=-10"), body(&test_path).await);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1082,7 +1094,7 @@ mod rfc_compliance_tests {
     async fn test_suffix_range_exceeds_length() -> io::Result<()> {
         let test_path = setup().await?;
         let body = body(&test_path).await;
-        let ranged = Ranged::new(range("bytes=-100"), body, None);
+        let ranged = Ranged::new(range("bytes=-100"), body);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1107,7 +1119,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_start_greater_than_end() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=30-20"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=30-20"), body(&test_path).await);
         let result = ranged.try_respond();
 
         assert!(result.is_err());
@@ -1121,7 +1133,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_first_and_last_byte() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=0-0,-1"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=0-0,-1"), body(&test_path).await);
 
         println!("Testing first and last byte range : ranged={:?}", ranged);
 
@@ -1152,7 +1164,7 @@ mod rfc_compliance_tests {
     async fn test_multiple_ranges() -> io::Result<()> {
         let test_path = setup().await?;
         let body = body(&test_path).await;
-        let ranged = Ranged::new(range("bytes=0-9,20-29,40-49"), body, None);
+        let ranged = Ranged::new(range("bytes=0-9,20-29,40-49"), body);
 
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
@@ -1180,14 +1192,14 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_multiple_ranges_content_length() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=40-41,0-1"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=40-41,0-1"), body(&test_path).await);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
             RangedResponse::Multiple { stream, boundary, content_length, .. } => {
                 let expected = format!(
-                    "--{b}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 40-41/62\r\n\r\nef\
-                     \r\n--{b}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-1/62\r\n\r\n01\
+                    "--{b}\r\nContent-Type: text/plain\r\nContent-Range: bytes 40-41/62\r\n\r\nef\
+                     \r\n--{b}\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-1/62\r\n\r\n01\
                      \r\n--{b}--\r\n",
                     b = boundary,
                 );
@@ -1204,7 +1216,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_zero_length_range() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=10-9"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=10-9"), body(&test_path).await);
         let result = ranged.try_respond();
 
         assert!(result.is_err());
@@ -1218,7 +1230,7 @@ mod rfc_compliance_tests {
     #[tokio::test]
     async fn test_range_only_start() -> io::Result<()> {
         let test_path = setup().await?;
-        let ranged = Ranged::new(range("bytes=50-"), body(&test_path).await, None);
+        let ranged = Ranged::new(range("bytes=50-"), body(&test_path).await);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1245,7 +1257,7 @@ mod rfc_compliance_tests {
         let test_path = setup().await?;
         let body = body(&test_path).await;
         // This wouldn't parse as a valid Range header, so we'd get None
-        let ranged = Ranged::new(None, body, None);
+        let ranged = Ranged::new(None, body);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1277,7 +1289,7 @@ mod rfc_compliance_tests {
         let body = body_blocks(&test_path, block_size).await;
 
         // Test with block size of 10
-        let ranged = Ranged::new(range("bytes=0-29"), body, None);
+        let ranged = Ranged::new(range("bytes=0-29"), body);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1300,7 +1312,7 @@ mod rfc_compliance_tests {
         let body = body_blocks(&test_path, block_size).await;
 
         // Test with block size of 10
-        let ranged = Ranged::new(range("bytes=10-29"), body, None);
+        let ranged = Ranged::new(range("bytes=10-29"), body);
         let response = ranged.try_respond().expect("try_respond should return Ok");
 
         match response {
@@ -1323,7 +1335,7 @@ mod rfc_compliance_tests {
         async fn test_first_500_bytes() {
             let file_length = std::fs::metadata("Cargo.lock").unwrap().len();
             let body = body("Cargo.lock").await;
-            let ranged = Ranged::new(range("bytes=0-499"), body, None);
+            let ranged = Ranged::new(range("bytes=0-499"), body);
             let response = ranged.try_respond().expect("try_respond should return Ok");
             match response {
                 RangedResponse::Single { content_range, content_length, stream, content_type } => {
@@ -2832,7 +2844,7 @@ mod rfc7233_tests {
     #[tokio::test]
     async fn no_range_on_block_limited_body_is_full_200() {
         let body = KnownSize::sized_blocks(Cursor::new(CONTENT), CONTENT.len() as u64, 10);
-        let (status, headers, content) = respond(Ranged::from_request(get(&[]), body, None)).await;
+        let (status, headers, content) = respond(Ranged::from_request(get(&[]), body)).await;
         assert_eq!(StatusCode::OK, status);
         assert_eq!(None, header(&headers, "content-range"));
         assert_eq!(CONTENT, &content[..]);
@@ -2843,7 +2855,7 @@ mod rfc7233_tests {
     #[tokio::test]
     async fn range_on_block_limited_body_is_capped_206() {
         let body = KnownSize::sized_blocks(Cursor::new(CONTENT), CONTENT.len() as u64, 10);
-        let (status, headers, content) = respond(Ranged::from_request(get(&[("range", "bytes=0-29")]), body, None)).await;
+        let (status, headers, content) = respond(Ranged::from_request(get(&[("range", "bytes=0-29")]), body)).await;
         assert_eq!(StatusCode::PARTIAL_CONTENT, status);
         assert_eq!(Some("bytes 0-9/62"), header(&headers, "content-range"));
         assert_eq!(b"0123456789", &content[..]);
@@ -2851,7 +2863,7 @@ mod rfc7233_tests {
 
     #[tokio::test]
     async fn empty_representation_without_range_is_200() {
-        let (status, headers, content) = respond(Ranged::from_request(get(&[]), body(b""), None)).await;
+        let (status, headers, content) = respond(Ranged::from_request(get(&[]), body(b""))).await;
         assert_eq!(StatusCode::OK, status);
         assert_eq!(Some("0"), header(&headers, "content-length"));
         assert!(content.is_empty());
@@ -2861,24 +2873,45 @@ mod rfc7233_tests {
     // but no Content-Range can describe zero bytes, so Range is ignored (§3.1)
     #[tokio::test]
     async fn empty_representation_with_suffix_range_is_200() {
-        let (status, _, content) = respond(Ranged::from_request(get(&[("range", "bytes=-5")]), body(b""), None)).await;
+        let (status, _, content) = respond(Ranged::from_request(get(&[("range", "bytes=-5")]), body(b""))).await;
         assert_eq!(StatusCode::OK, status);
         assert!(content.is_empty());
     }
 
     #[tokio::test]
     async fn empty_representation_with_range_is_416() {
-        let (status, headers, _) = respond(Ranged::from_request(get(&[("range", "bytes=0-")]), body(b""), None)).await;
+        let (status, headers, _) = respond(Ranged::from_request(get(&[("range", "bytes=0-")]), body(b""))).await;
         assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, status);
         assert_eq!(Some("bytes */0"), header(&headers, "content-range"));
     }
 
     #[tokio::test]
     async fn range_covering_everything_is_206() {
-        let (status, headers, content) = respond(Ranged::from_request(get(&[("range", "bytes=0-")]), body(CONTENT), None)).await;
+        let (status, headers, content) = respond(Ranged::from_request(get(&[("range", "bytes=0-")]), body(CONTENT))).await;
         assert_eq!(StatusCode::PARTIAL_CONTENT, status);
         assert_eq!(Some("bytes 0-61/62"), header(&headers, "content-range"));
         assert_eq!(CONTENT, &content[..]);
+    }
+
+    // Content-Type comes from the body unless overridden
+    #[tokio::test]
+    async fn content_type_from_body_or_override() {
+        let file = KnownSize::file("test/fixture_abc.txt".into()).await.unwrap();
+        let (_, headers, _) = respond_file(Ranged::new(None, file)).await;
+        assert_eq!(Some("text/plain"), header(&headers, "content-type"));
+
+        let file = KnownSize::file("test/fixture_abc.txt".into()).await.unwrap();
+        let ranged = Ranged::new(None, file).with_content_type("text/csv".to_string());
+        let (_, headers, _) = respond_file(ranged).await;
+        assert_eq!(Some("text/csv"), header(&headers, "content-type"));
+
+        let (_, headers, _) = respond(Ranged::new(None, body(CONTENT))).await;
+        assert_eq!(Some("application/octet-stream"), header(&headers, "content-type"));
+    }
+
+    async fn respond_file(ranged: Ranged<KnownSize<tokio::fs::File>>) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let (parts, body) = ranged.into_response().into_parts();
+        (parts.status, parts.headers, to_bytes(body, usize::MAX).await.unwrap().to_vec())
     }
 
     // §3.1: a server MUST ignore a Range header field received with a request
@@ -2886,7 +2919,7 @@ mod rfc7233_tests {
     #[tokio::test]
     async fn range_on_other_methods_is_ignored() {
         for method in [Method::HEAD, Method::POST, Method::PUT] {
-            let ranged = Ranged::from_request(request(method.clone(), &[("range", "bytes=0-9")]), body(CONTENT), None);
+            let ranged = Ranged::from_request(request(method.clone(), &[("range", "bytes=0-9")]), body(CONTENT));
             let (status, headers, _) = respond(ranged).await;
             assert_eq!(StatusCode::OK, status, "{method}");
             assert_eq!(None, header(&headers, "content-range"), "{method}");
@@ -2899,7 +2932,7 @@ mod rfc7233_tests {
     #[tokio::test]
     async fn unknown_range_unit_is_ignored() {
         for range in ["items=0-5", "bytes 0-5", "none"] {
-            let (status, _, content) = respond(Ranged::from_request(get(&[("range", range)]), body(CONTENT), None)).await;
+            let (status, _, content) = respond(Ranged::from_request(get(&[("range", range)]), body(CONTENT))).await;
             assert_eq!(StatusCode::OK, status, "{range}");
             assert_eq!(CONTENT, &content[..], "{range}");
         }
@@ -2908,7 +2941,7 @@ mod rfc7233_tests {
     // §2: range-unit is compared case-insensitively
     #[tokio::test]
     async fn range_unit_is_case_insensitive() {
-        let (status, _, content) = respond(Ranged::from_request(get(&[("range", "Bytes=0-1")]), body(CONTENT), None)).await;
+        let (status, _, content) = respond(Ranged::from_request(get(&[("range", "Bytes=0-1")]), body(CONTENT))).await;
         assert_eq!(StatusCode::PARTIAL_CONTENT, status);
         assert_eq!(b"01", &content[..]);
     }
@@ -2917,7 +2950,7 @@ mod rfc7233_tests {
     #[tokio::test]
     async fn invalid_or_unsatisfiable_range_is_416() {
         for range in ["bytes=9-0", "bytes=x-1", "bytes=62-", "bytes=-0"] {
-            let (status, headers, _) = respond(Ranged::from_request(get(&[("range", range)]), body(CONTENT), None)).await;
+            let (status, headers, _) = respond(Ranged::from_request(get(&[("range", range)]), body(CONTENT))).await;
             assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, status, "{range}");
             assert_eq!(Some("bytes */62"), header(&headers, "content-range"), "{range}");
         }
@@ -2926,7 +2959,7 @@ mod rfc7233_tests {
     #[tokio::test]
     async fn repeated_range_field_is_ignored() {
         let request = get(&[("range", "bytes=0-1"), ("range", "bytes=2-3")]);
-        let (status, _, _) = respond(Ranged::from_request(request, body(CONTENT), None)).await;
+        let (status, _, _) = respond(Ranged::from_request(request, body(CONTENT))).await;
         assert_eq!(StatusCode::OK, status);
     }
 
@@ -2944,7 +2977,7 @@ mod rfc7233_tests {
     const DATE_LATER: &str = "Wed, 21 Oct 2015 07:28:01 GMT";
 
     async fn if_range(validator: &'static str, current_etag: Option<&'static str>, current_date: bool) -> StatusCode {
-        let mut ranged = Ranged::from_request(get(&[("range", "bytes=0-9"), ("if-range", validator)]), body(CONTENT), None);
+        let mut ranged = Ranged::from_request(get(&[("range", "bytes=0-9"), ("if-range", validator)]), body(CONTENT));
         if let Some(tag) = current_etag {
             ranged = ranged.with_etag(etag(tag));
         }
@@ -2988,7 +3021,7 @@ mod rfc7233_tests {
     // §3.2: a server MUST ignore If-Range without Range
     #[tokio::test]
     async fn if_range_without_range_is_ignored() {
-        let ranged = Ranged::from_request(get(&[("if-range", "\"v1\"")]), body(CONTENT), None).with_etag(etag("\"v1\""));
+        let ranged = Ranged::from_request(get(&[("if-range", "\"v1\"")]), body(CONTENT)).with_etag(etag("\"v1\""));
         let (status, _, content) = respond(ranged).await;
         assert_eq!(StatusCode::OK, status);
         assert_eq!(CONTENT, &content[..]);

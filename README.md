@@ -20,7 +20,7 @@ use axum_range::{KnownSize, RangeRequest, Ranged};
 async fn file(request: RangeRequest) -> Ranged<KnownSize<File>> {
     let file = PathBuf::from("archlinux-x86_64.iso");
     let body = KnownSize::file(file).await.unwrap();
-    Ranged::from_request(request, body, None)
+    Ranged::from_request(request, body)
 }
 ```
 

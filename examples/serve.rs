@@ -69,13 +69,8 @@ async fn get_file(
             } else {
                 match KnownSize::file(file).await {
                     Ok(body) => {
-                        let content_type = body.content_type();
-                        // If we have a range header, use it
-                        if let Some(TypedHeader(range)) = range_header {
-                            Ranged::new(Some(range), body, content_type).into_response()
-                        } else {
-                            Ranged::new(None, body, content_type).into_response()
-                        }
+                        let range = range_header.map(|TypedHeader(range)| range);
+                        Ranged::new(range, body).into_response()
                     }
                     Err(e) => {
                         (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response()
