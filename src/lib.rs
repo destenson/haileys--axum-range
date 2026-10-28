@@ -248,6 +248,7 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                 } else {
                     let boundary = generate_boundary();
                     let multipart_stream = MultipartStream::new(self.body, satisfiable_ranges, total_bytes, boundary.clone(), content_type.clone());
+                    let content_length = ContentLength(multipart_stream.byte_len());
                     Ok(RangedResponse::Multiple {
                         boundary,
                         stream: multipart_stream,
@@ -318,8 +319,9 @@ trait RangeParser {
 }
 
 /// Parses a `Range` header value into the byte ranges it selects from a
-/// representation of `target_size` bytes, as inclusive bounds, sorted and with
-/// overlapping ranges merged.
+/// representation of `target_size` bytes, as inclusive bounds. Overlapping
+/// ranges are merged, and the rest keep the order they were requested in,
+/// as RFC 7233 §4.1 asks of multipart responses.
 ///
 /// Per RFC 9110 §14.1.2, a last-byte-pos at or past the end is clamped to the
 /// last byte, and a suffix longer than the representation selects all of it.
@@ -372,16 +374,24 @@ fn parse_range_header(range_header: &str, target_size: u64) -> Result<Vec<(Bound
         return Err(ParseRangesError::Unsatisfiable(range_header.to_string()));
     }
 
-    ranges.sort_unstable();
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-    for (first, last) in ranges {
+    // merge overlapping ranges in position order, remembering where each
+    // merged range first appeared in the request
+    let mut by_position: Vec<usize> = (0..ranges.len()).collect();
+    by_position.sort_unstable_by_key(|&index| ranges[index]);
+    let mut merged: Vec<(usize, u64, u64)> = Vec::with_capacity(ranges.len());
+    for index in by_position {
+        let (first, last) = ranges[index];
         match merged.last_mut() {
-            Some((_, prev_last)) if first <= *prev_last => *prev_last = (*prev_last).max(last),
-            _ => merged.push((first, last)),
+            Some((first_index, _, prev_last)) if first <= *prev_last => {
+                *prev_last = (*prev_last).max(last);
+                *first_index = (*first_index).min(index);
+            }
+            _ => merged.push((index, first, last)),
         }
     }
+    merged.sort_unstable_by_key(|&(first_index, _, _)| first_index);
 
-    Ok(merged.into_iter().map(|(first, last)| (Bound::Included(first), Bound::Included(last))).collect())
+    Ok(merged.into_iter().map(|(_, first, last)| (Bound::Included(first), Bound::Included(last))).collect())
 }
 
 #[test]
@@ -444,6 +454,16 @@ fn test_parse_range_header() {
         ("bytes=30-20", 62, Err(ParseRangesError::InvalidByteRange("30-20".to_string()))),
         ("bytes=+1-2", 62, Err(ParseRangesError::InvalidByteRange("+1-2".to_string()))),
         ("bytes=0-1", 0, Err(ParseRangesError::Unsatisfiable("bytes=0-1".to_string()))),
+        // parts keep request order; a merged range takes the position of its earliest member
+        ("bytes=40-49,0-9", 62, Ok(vec![
+            (Bound::Included(40), Bound::Included(49)),
+            (Bound::Included(0), Bound::Included(9))
+        ])),
+        ("bytes=-1,20-29,0-4,25-35", 62, Ok(vec![
+            (Bound::Included(61), Bound::Included(61)),
+            (Bound::Included(20), Bound::Included(35)),
+            (Bound::Included(0), Bound::Included(4))
+        ])),
     ];
 
     for (i, (range_header, target_size, expected)) in tests.iter().enumerate() {
@@ -1048,6 +1068,31 @@ mod rfc_compliance_tests {
         // assert_eq!(Some(expected_content_range), response.content_range);
         // let content = collect_stream(response.stream).await;
         // assert_eq!("0123456789", &content);
+        Ok(())
+    }
+
+    // Content-Length of a multipart response must count the whole body,
+    // boundaries and part headers included, and parts keep request order
+    #[tokio::test]
+    async fn test_multiple_ranges_content_length() -> io::Result<()> {
+        let test_path = setup().await?;
+        let ranged = Ranged::new(range("bytes=40-41,0-1"), body(&test_path).await, None);
+        let response = ranged.try_respond().expect("try_respond should return Ok");
+
+        match response {
+            RangedResponse::Multiple { stream, boundary, content_length, .. } => {
+                let expected = format!(
+                    "--{b}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 40-41/62\r\n\r\nef\
+                     \r\n--{b}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-1/62\r\n\r\n01\
+                     \r\n--{b}--\r\n",
+                    b = boundary,
+                );
+                let content = collect_stream(stream).await;
+                assert_eq!(expected, content);
+                assert_eq!(ContentLength(expected.len() as u64), content_length);
+            }
+            _ => panic!("Expected a multiple range response"),
+        }
         Ok(())
     }
 
