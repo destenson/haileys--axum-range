@@ -87,119 +87,65 @@ async fn get_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::Router;
-    use axum::routing::get;
-    use std::net::SocketAddr;
-    use tokio::fs::File;
-    use tokio::io::AsyncWriteExt;
+    use std::convert::Infallible;
     use axum_range::extract_boundary;
+
+    const FIXTURE: &str = "test/fixture_abc.txt";
+    const CONTENT: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
     #[tokio::test]
     async fn test_get_file_with_range() {
-        std::env::set_var("RUST_LOG", "debug");
-        tracing_subscriber::fmt::init();
-        // Create a temporary file for testing
-        let test_file_path = "../video-browser/output-1.mp4";
-        // let test_file_path = "test_file.txt";
-        // let mut file = File::create(test_file_path).await.unwrap();
-        // file.write_all(b"Hello, World!").await.unwrap();
-        // drop(file); // Close the file before the server tries to open it
-
-        // Set up the router
         let app = Router::new().route("/file", get(get_file));
-
-        // Start the server
-        let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
-        let server_handle = tokio::spawn(async move {
-            axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app.into_make_service()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
         });
 
-        // Give the server a moment to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-
-        // Create a client
         let client = reqwest::Client::new();
+        let url = format!("http://{addr}/file?path={FIXTURE}");
 
-        // Test with a valid range
-        let response = client
-            .get(format!("http://{}/file?path={}", addr, test_file_path))
-            .header("Range", "bytes=0-4")
-            .send()
-            .await
-            .unwrap();
+        // single range
+        let response = client.get(&url).header("Range", "bytes=0-4").send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()["Content-Range"], "bytes 0-4/62");
+        assert_eq!(response.text().await.unwrap(), "01234");
+
+        // multiple ranges: multipart/byteranges, parts in request order, and a
+        // Content-Length covering the whole multipart body
+        let response = client.get(&url).header("Range", "bytes=-1,0-4").send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        let content_type = response.headers()["Content-Type"].to_str().unwrap().to_string();
+        assert!(content_type.starts_with("multipart/byteranges;"), "{content_type}");
+        let boundary = extract_boundary(&content_type).unwrap();
+        let content_length: usize = response.headers()["Content-Length"].to_str().unwrap().parse().unwrap();
         let body = response.bytes().await.unwrap();
-        assert_eq!(body.len(), 5);
+        assert_eq!(content_length, body.len());
 
-        // Test with a split range
-        let response = client
-            .get(format!("http://{}/file?path={}", addr, test_file_path))
-            .header("Range", "bytes=0-4,-1")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-        println!("Response headers: {:?}", response.headers());
-        
-        let content_type = response.headers().get("Content-Type").unwrap().to_str().unwrap();
-        let boundary = extract_boundary(content_type).unwrap();
-        assert!(!boundary.is_empty(), "Boundary should be present in the Content-Type header");
-        // // assert_eq!(response.headers().get("Content-Range").unwrap(), "bytes 0-4,-1");
-        // let parts = parse_multipart_response(body, &boundary).await.unwrap();
-        // assert_eq!(parts.len(), 2);
-        // assert_eq!(parts[0].1.len(), 5); // bytes 0-4
-        // assert_eq!(parts[1].1.len(), 5); // bytes 10-14
+        let stream = futures::stream::once(async move { Ok::<_, Infallible>(body) });
+        let mut multipart = multer::Multipart::new(stream, boundary);
+        let mut parts = Vec::new();
+        while let Some(field) = multipart.next_field().await.unwrap() {
+            let content_range = field.headers()["Content-Range"].to_str().unwrap().to_string();
+            let content_type = field.headers()["Content-Type"].to_str().unwrap().to_string();
+            parts.push((content_range, content_type, field.text().await.unwrap()));
+        }
+        assert_eq!(parts, [
+            ("bytes 61-61/62".to_string(), "text/plain".to_string(), "z".to_string()),
+            ("bytes 0-4/62".to_string(), "text/plain".to_string(), "01234".to_string()),
+        ]);
 
-
-        // Test with a split range
-        println!("Testing split range");
-        let response = client
-            .get(format!("http://{}/file?path={}", addr, test_file_path))
-            .header("Range", "bytes=0-4,-1/*")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-        println!("Response headers: {:?}", response.headers());
-
-        let content_type = response.headers().get("Content-Type").unwrap().to_str().unwrap();
-        let boundary = extract_boundary(content_type).unwrap();
-        assert!(!boundary.is_empty(), "Boundary should be present in the Content-Type header");
-        // // assert_eq!(response.headers().get("Content-Range").unwrap(), "bytes 0-4,-1");
-        // let parts = parse_multipart_response(body, &boundary).await.unwrap();
-        // assert_eq!(parts.len(), 2);
-        // assert_eq!(parts[0].1.len(), 5); // bytes 0-4
-        // assert_eq!(parts[1].1.len(), 5); // bytes 10-14
-
-        let body = response.bytes().await.unwrap();
-        assert_eq!(body.len(), 6);
-
-        
-        // Test with an invalid range
-        let response = client
-            .get(format!("http://{}/file?path={}", addr, test_file_path))
-            .header("Range", "bytes=1000000-2000000")
-            .send()
-            .await
-            .unwrap();
+        // unsatisfiable range
+        let response = client.get(&url).header("Range", "bytes=1000000-2000000").send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()["Content-Range"], "bytes */62");
 
-        // Test without a range header (full file)
-        let response = client
-            .get(format!("http://{}/file?path={}", addr, test_file_path))
-            .send()
-            .await
-            .unwrap();
+        // no range: the whole file
+        let response = client.get(&url).send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let body = response.bytes().await.unwrap();
-        assert_eq!(body, "Hello, World!");
+        assert_eq!(response.text().await.unwrap(), CONTENT);
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(20)).await; // Wait for the server to finish processing
-
-        // Clean up
-        tokio::fs::remove_file(test_file_path).await.unwrap();
-        server_handle.abort(); // Stop the server
+        server.abort();
     }
 }
 
