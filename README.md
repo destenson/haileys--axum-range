@@ -14,16 +14,18 @@ MIT license.
 use axum_extra::TypedHeader;
 use axum_extra::headers::Range;
 
+use std::path::PathBuf;
+
 use tokio::fs::File;
 
 use axum_range::Ranged;
 use axum_range::KnownSize;
 
 async fn file(range: Option<TypedHeader<Range>>) -> Ranged<KnownSize<File>> {
-    let file = File::open("archlinux-x86_64.iso").await.unwrap();
+    let file = PathBuf::from("archlinux-x86_64.iso");
     let body = KnownSize::file(file).await.unwrap();
     let range = range.map(|TypedHeader(range)| range);
-    Ranged::new(range, body)
+    Ranged::new(range, body, None)
 }
 ```
 
