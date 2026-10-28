@@ -201,8 +201,16 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
 
     /// The media type to send as `Content-Type`, overriding
     /// [`RangeBody::content_type`].
-    pub fn with_content_type(mut self, content_type: String) -> Self {
-        self.content_type = Some(content_type);
+    ///
+    /// Set the media type here rather than by adding a `Content-Type` header
+    /// field to the response from outside (e.g. an axum `(headers, ranged)`
+    /// tuple): that replaces the header field rather than adding to it, which
+    /// on a multi-range response overwrites the required
+    /// `multipart/byteranges; boundary=...` type and leaves each part with the
+    /// body's own media type. Other header fields, such as `ETag` or
+    /// `Cache-Control`, are fine to add from outside.
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
         self
     }
 
@@ -2901,7 +2909,7 @@ mod rfc7233_tests {
         assert_eq!(Some("text/plain"), header(&headers, "content-type"));
 
         let file = KnownSize::file("test/fixture_abc.txt".into()).await.unwrap();
-        let ranged = Ranged::new(None, file).with_content_type("text/csv".to_string());
+        let ranged = Ranged::new(None, file).with_content_type("text/csv");
         let (_, headers, _) = respond_file(ranged).await;
         assert_eq!(Some("text/csv"), header(&headers, "content-type"));
 
