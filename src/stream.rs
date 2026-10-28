@@ -164,7 +164,43 @@ impl<B: RangeBody + Send + 'static> MultipartStream<B> {
             body,
         }
     }
+}
 
+impl<B> MultipartStream<B> {
+    /// Exact length in bytes of the multipart body this stream produces.
+    pub fn byte_len(&self) -> u64 {
+        let parts: u64 = self.ranges.iter().enumerate()
+            .map(|(index, range)| {
+                let boundary_line = boundary_line(&self.boundary, index == 0);
+                let headers = part_headers(range, self.total_size, self.content_type.as_deref());
+                boundary_line.len() as u64 + headers.len() as u64 + range.len()
+            })
+            .sum();
+        parts + final_boundary(&self.boundary).len() as u64
+    }
+}
+
+fn boundary_line(boundary: &str, first: bool) -> String {
+    if first {
+        format!("--{}\r\n", boundary)
+    } else {
+        format!("\r\n--{}\r\n", boundary)
+    }
+}
+
+fn part_headers(range: &ByteRange, total_size: u64, content_type: Option<&str>) -> String {
+    format!(
+        "Content-Type: {}\r\n\
+         Content-Range: bytes {}-{}/{}\r\n\r\n",
+        content_type.unwrap_or("application/octet-stream"),
+        range.start,
+        range.end_exclusive - 1, // HTTP ranges are inclusive
+        total_size
+    )
+}
+
+fn final_boundary(boundary: &str) -> String {
+    format!("\r\n--{}--\r\n", boundary)
 }
 
 #[derive(Debug)]
@@ -189,9 +225,7 @@ impl<B: RangeBody> Body for MultipartStream<B> {
     type Error = io::Error;
 
     fn size_hint(&self) -> SizeHint {
-        // For multipart responses, we can't easily predict the exact size
-        // due to the boundary and header overhead
-        SizeHint::default()
+        SizeHint::with_exact(self.byte_len())
     }
 
     fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>)
@@ -218,12 +252,8 @@ impl<B: RangeBody> Stream for MultipartStream<B> {
                         continue;
                     }
 
-                    let boundary_line = if *first {
-                        *first = false;
-                        format!("--{}\r\n", this.boundary)
-                    } else {
-                        format!("\r\n--{}\r\n", this.boundary)
-                    };
+                    let boundary_line = boundary_line(this.boundary, *first);
+                    *first = false;
 
                     *this.state = MultipartState::WritingHeaders;
                     return Poll::Ready(Some(Ok(Bytes::from(boundary_line))));
@@ -231,14 +261,7 @@ impl<B: RangeBody> Stream for MultipartStream<B> {
 
                 MultipartState::WritingHeaders => {
                     let range = &this.ranges[*this.current_range_index];
-                    let headers = format!(
-                        "Content-Type: {}\r\n\
-                         Content-Range: bytes {}-{}/{}\r\n\r\n",
-                        this.content_type.clone().unwrap_or_else(||"application/octet-stream".to_string()),
-                        range.start,
-                        range.end_exclusive - 1, // HTTP ranges are inclusive
-                        this.total_size
-                    );
+                    let headers = part_headers(range, *this.total_size, this.content_type.as_deref());
 
                     *this.state = MultipartState::Seek { start: range.start };
                     return Poll::Ready(Some(Ok(Bytes::from(headers))));
@@ -312,9 +335,8 @@ impl<B: RangeBody> Stream for MultipartStream<B> {
                 }
 
                 MultipartState::WritingFinalBoundary => {
-                    let final_boundary = format!("\r\n--{}--\r\n", this.boundary);
                     *this.state = MultipartState::Finished;
-                    return Poll::Ready(Some(Ok(Bytes::from(final_boundary))));
+                    return Poll::Ready(Some(Ok(Bytes::from(final_boundary(this.boundary)))));
                 }
 
                 MultipartState::Finished => {
