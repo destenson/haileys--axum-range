@@ -131,6 +131,10 @@ impl<B: AsyncRead + AsyncSeekStart> RangeBody for KnownSize<B> {
     fn block_len(&self) -> u64 {
         self.block_len
     }
+
+    fn content_type(&self) -> Option<String> {
+        self.content_type.clone()
+    }
 }
 
 #[cfg(test)]
