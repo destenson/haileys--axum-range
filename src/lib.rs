@@ -1,53 +1,154 @@
 #![allow(unused)]
 //! # axum-range
 //!
-//! HTTP range responses for [`axum`][1].
+//! HTTP range requests ([RFC 7233]) for [`axum`]: partial content, multiple
+//! ranges, and `If-Range`, served from any seekable body.
 //!
-//! Fully generic, supports any body implementing the [`RangeBody`] trait.
-//!
-//! Any type implementing both [`AsyncRead`] and [`AsyncSeekStart`] can be
-//! used the [`KnownSize`] adapter struct. There is also special cased support
-//! for [`tokio::fs::File`], see the [`KnownSize::file`] method.
-//!
-//! [`AsyncSeekStart`] is a trait defined by this crate which only allows
-//! seeking from the start of a file. It is automatically implemented for any
-//! type implementing [`AsyncSeek`].
-//!
-//! ```
-//! use axum::Router;
-//! use axum::routing::get;
-//!
+//! ```no_run
 //! use std::path::PathBuf;
-//! use std::str::FromStr;
 //!
+//! use axum::Router;
+//! use axum::http::StatusCode;
+//! use axum::routing::get;
 //! use axum_range::{KnownSize, RangeRequest, Ranged};
 //!
-//! async fn file(request: RangeRequest) -> Ranged<KnownSize<tokio::fs::File>> {
-//!     let file = PathBuf::from_str("document.txt").unwrap();
-//!     let body = KnownSize::file(file).await.unwrap();
-//!     Ranged::from_request(request, body)
+//! async fn video(request: RangeRequest) -> Result<Ranged<KnownSize<tokio::fs::File>>, StatusCode> {
+//!     let body = KnownSize::file(PathBuf::from("video.mp4"))
+//!         .await
+//!         .map_err(|_| StatusCode::NOT_FOUND)?;
+//!     Ok(Ranged::from_request(request, body))
 //! }
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     // build our application with a single route
-//!     let _app = Router::<()>::new().route("/", get(file));
-//!
-//!     // run it with hyper on localhost:3000
-//!     #[cfg(feature = "run_server_in_example")]
-//!     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-//!        .serve(_app.into_make_service())
-//!        .await
-//!        .unwrap();
+//!     let app = Router::new().route("/video.mp4", get(video));
+//!     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+//!     axum::serve(listener, app).await.unwrap();
 //! }
 //! ```
 //!
-//! [`RangeRequest`] extracts the `Range` and `If-Range` header fields, and
-//! drops them for methods other than GET (RFC 7233 §3.1). To evaluate
-//! `If-Range` (RFC 7233 §3.2), supply the representation's current
-//! validators with [`Ranged::with_etag`] and [`Ranged::with_last_modified`].
+//! [`RangeRequest`] is an extractor that never rejects a request. It reads the
+//! `Range` and `If-Range` header fields, and drops them for any method other
+//! than GET, since range requests are only defined for GET (§3.1). Routes
+//! made with [`get`](axum::routing::get) also answer HEAD, which therefore
+//! gets the full 200 response headers.
 //!
-//! [1]: https://docs.rs/axum
+//! ## What gets sent
+//!
+//! | Request | Response |
+//! |---|---|
+//! | No `Range`; not GET; a range unit other than `bytes`; or an `If-Range` that doesn't match | 200, the whole body |
+//! | One satisfiable range | 206 with `Content-Range` |
+//! | Several satisfiable ranges | 206 `multipart/byteranges`, parts in the order requested, overlapping ranges merged |
+//! | Invalid or unsatisfiable ranges, e.g. `bytes=9-0`, or starting past the end | 416 with `Content-Range: bytes */<length>` |
+//!
+//! A range ending past the end of the body is cut short at the end, and a
+//! suffix range (`bytes=-500`) longer than the body selects all of it (§2.1).
+//! 200 and 206 responses carry `Accept-Ranges: bytes`.
+//!
+//! ## Bodies
+//!
+//! Anything implementing [`RangeBody`] can be served: [`AsyncRead`] plus
+//! [`AsyncSeekStart`], with a known size. [`AsyncSeekStart`] is a trait
+//! defined by this crate that only allows seeking from the start; it is
+//! implemented for every [`AsyncSeek`].
+//!
+//! The [`KnownSize`] adapter turns a reader into a [`RangeBody`]:
+//!
+//! - [`KnownSize::file`] opens a file, takes its size from metadata, and
+//!   guesses its media type from the extension.
+//! - [`KnownSize::seek`] finds the size by seeking to the end.
+//! - [`KnownSize::sized`] takes a size you already know.
+//!
+//! Each has a `_blocks` variant ([`KnownSize::file_blocks`],
+//! [`KnownSize::seek_blocks`], [`KnownSize::sized_blocks`]) that serves at
+//! most one block of the given length per range. The response's
+//! `Content-Range` says what was sent, and the client asks again for the
+//! rest. Requests without `Range` still get the whole body.
+//!
+//! ## Content-Type
+//!
+//! The media type comes from [`RangeBody::content_type`] (for
+//! [`KnownSize::file`], the guess from the extension), falling back to
+//! `application/octet-stream`. To choose it yourself, use
+//! [`Ranged::with_content_type`]:
+//!
+//! ```
+//! # use axum_range::{KnownSize, RangeRequest, Ranged};
+//! # fn example(request: RangeRequest, body: KnownSize<tokio::fs::File>) -> Ranged<KnownSize<tokio::fs::File>> {
+//! Ranged::from_request(request, body).with_content_type("video/webm")
+//! # }
+//! ```
+//!
+//! Don't add `Content-Type` from outside instead, e.g. with an axum
+//! `([(CONTENT_TYPE, ...)], ranged)` tuple. That replaces the header field
+//! after [`Ranged`] has built the response, which for multiple ranges
+//! overwrites the required `multipart/byteranges; boundary=...` type, so the
+//! client cannot split the parts. Other header fields are fine to add that
+//! way.
+//!
+//! ## Conditional requests
+//!
+//! `If-Range` (§3.2) asks for the range only if the representation is
+//! unchanged, and for the whole of it otherwise. To evaluate it, give
+//! [`Ranged`] the representation's current validators with
+//! [`Ranged::with_etag`] and [`Ranged::with_last_modified`]. Without them,
+//! a request carrying `If-Range` always gets the whole body, which is
+//! correct but means the range is never served. Entity-tags must match by
+//! strong comparison, and dates exactly.
+//!
+//! The crate only compares validators; send the `ETag` and `Last-Modified`
+//! header fields yourself:
+//!
+//! ```
+//! use std::path::PathBuf;
+//! use std::time::UNIX_EPOCH;
+//!
+//! use axum::http::StatusCode;
+//! use axum::response::IntoResponse;
+//! use axum_extra::TypedHeader;
+//! use axum_extra::headers::ETag;
+//! use axum_range::{KnownSize, RangeBody, RangeRequest, Ranged};
+//!
+//! async fn video(request: RangeRequest) -> Result<impl IntoResponse, StatusCode> {
+//!     let path = PathBuf::from("video.mp4");
+//!     let modified = tokio::fs::metadata(&path)
+//!         .await
+//!         .and_then(|metadata| metadata.modified())
+//!         .map_err(|_| StatusCode::NOT_FOUND)?;
+//!     let body = KnownSize::file(path).await.map_err(|_| StatusCode::NOT_FOUND)?;
+//!
+//!     let nanos = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+//!     let etag: ETag = format!("\"{:x}-{:x}\"", nanos, body.byte_size()).parse().unwrap();
+//!
+//!     let ranged = Ranged::from_request(request, body).with_etag(etag.clone());
+//!     Ok((TypedHeader(etag), ranged))
+//! }
+//! ```
+//!
+//! Only pass a `Last-Modified` date if it is a strong validator: the
+//! representation cannot change twice within the same second.
+//!
+//! Other preconditions (`If-Match`, `If-None-Match`, `If-Modified-Since`,
+//! `If-Unmodified-Since`) are up to the server. Evaluate them first, and
+//! only respond with [`Ranged`] when the response would otherwise be 200
+//! (§3.1); a 304 or 412 takes precedence over `Range`.
+//!
+//! ## Other entry points
+//!
+//! [`Ranged::new`] takes an already-extracted [`Range`] header, as in earlier
+//! versions of this crate. Only pass a `Range` received on a GET request.
+//! Note that extracting `Option<TypedHeader<Range>>` rejects a range unit
+//! other than `bytes` with 400, where §3.1 requires ignoring it; prefer
+//! [`RangeRequest`].
+//!
+//! [`Ranged::try_respond`] returns the response's pieces as a
+//! [`RangedResponse`] (or [`RangeNotSatisfiable`]) instead of an axum
+//! response, for building the response yourself.
+//!
+//! Section numbers (§) refer to [RFC 7233].
+//!
+//! [RFC 7233]: https://www.rfc-editor.org/rfc/rfc7233
 
 mod file;
 mod stream;
