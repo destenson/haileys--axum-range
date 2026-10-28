@@ -28,7 +28,7 @@
 //! let file = PathBuf::from_str("document.txt").unwrap();
 //!     let body = KnownSize::file(file).await.unwrap();
 //!     let range = range.map(|TypedHeader(range)| range);
-//!     Ranged::new(range, body)
+//!     Ranged::new(range, body, None)
 //! }
 //!
 //! #[tokio::main]
@@ -216,230 +216,38 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
 
                 */
 
-                println!("range: {:?}", range);
-                // hacky way to get the range string for parsing
-                let mut range_str = format!("{:?}", range).replace("Range(\"", "").replace("\")", "");
-                println!("total_bytes: {}", total_bytes);
-                let ranges = parse_range_header(&range_str, total_bytes)
-                    .map_err(|e| {
-                        eprintln!("Error parsing range header: {:?}", e);
-                        RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes))
-                    })?;
-                println!("Parsed ranges: {:?}", ranges);
-                // let parsed_ranges = parse_ranges(range_str.clone())
-                //     .map_err(|e|RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?;
-                // // count all the commas in the range string
-                let range_ct = range_str.as_str()
-                    .chars()
-                    .filter(|&c| c == ',')
-                    .count() + 1;
-                // if parsed_ranges.0.len() != range_ct {
-                //     eprintln!("Parsed ranges count {} does not match expected count {}", parsed_ranges.0.len(), range_ct);
-                //     return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
-                // }
-                /*
-                    Satisfiability:
-                    If a valid byte-range-set includes at least one byte-range-spec with
-                    a first-byte-pos that is less than the current length of the
-                    representation, or at least one suffix-byte-range-spec with a
-                    non-zero suffix-length, then the byte-range-set is satisfiable.
-                    Otherwise, the byte-range-set is unsatisfiable.
-                 */
-                // Parse all satisfiable ranges
-                let satisfiable_ranges: Vec<_> = range
-                    .satisfiable_ranges(total_bytes)
-                    .map(|(start_bound, end_bound)| {
-                        println!("start_bound: {:?}, end_bound: {:?}", start_bound, end_bound);
-                        let start = match start_bound {
-                            Bound::Included(start) => start,
-                            _ => 0,
-                        };
+                let mut values = Vec::new();
+                range.encode(&mut values);
+                let range_str = values.first().and_then(|value| value.to_str().ok()).unwrap_or_default();
 
-                        // Check if start position is valid
-                        if start >= total_bytes {
-                            eprintln!("Start position {} exceeds total bytes {}", start, total_bytes);
-                            return None;
+                let satisfiable_ranges: Vec<ByteRange> = parse_range_header(range_str, total_bytes)
+                    .map_err(|_| RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?
+                    .into_iter()
+                    .map(|range| match range {
+                        // HTTP byte ranges are inclusive, so we translate to exclusive by adding 1,
+                        // and never serve more than one block per range
+                        (Bound::Included(start), Bound::Included(end)) => {
+                            ByteRange::new(start, (end + 1).min(start.saturating_add(block_len)))
                         }
-
-                        let end = match end_bound {
-                            // HTTP byte ranges are inclusive, so we translate to exclusive by adding 1
-                            Bound::Included(end) => end + 1,
-                            Bound::Excluded(end) => end,
-                            _ => start + block_len,
-                        };
-                        // Check for invalid conditions
-                        if start >= end {
-                            eprintln!("Start position {} is greater than or equal to end position {}", start, end);
-                            return None;
-                        }
-
-                        // If end exceeds total_bytes, adjust it to total_bytes as per RFC
-                        let end = {
-                            let mut end = std::cmp::min(match end_bound {
-                                // HTTP byte ranges are inclusive, so we translate to exclusive by adding 1
-                                Bound::Included(end) => end + 1,
-                                Bound::Excluded(end) => end,
-                                _ => start + block_len,
-                            }, total_bytes);
-                            if end - start > block_len {
-                                start + block_len
-                            } else {
-                                end
-                            }
-                        };
-                        
-                        Some(ByteRange::new(start, end))
+                        _ => unreachable!("parse_range_header only returns inclusive bounds"),
                     })
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?;
-
-                eprintln!("{} satisfiable_ranges {} expected", satisfiable_ranges.len(), range_ct);
-                let satisfiable_ranges = if satisfiable_ranges.len() != range_ct {
-                    eprintln!("Number of satisfiable ranges does not match expected count");
-                    let range_strs = satisfiable_ranges.iter()
-                        .map(|r| format!("{}-{}", r.start, r.end_exclusive - 1))
-                        .collect::<Vec<_>>();
-                        // .join(",");
-                    eprintln!("Satisfiable ranges: {:?}", range_strs);
-                    // new range string with the satisfiable ranges removed, so we can process the rest
-                    let mut undetected_ranges = Vec::new();
-                    for range in satisfiable_ranges.iter() {
-                        if range_str.contains(&format!("{}-{}", range.start, range.end_exclusive - 1)) {
-                            println!("Removing found range {}-{} from range string", range.start, range.end_exclusive - 1);
-                            // remove the range from the string
-                            range_str = range_str.replace(&format!("{}-{}", range.start, range.end_exclusive - 1), "");
-                        } else {
-                            // if the range is not in the string, we can just add it to the new string
-                            undetected_ranges.push(format!("{},", range_str));
-                        }
-                    }
-                    range_str = if range_str.ends_with(',') {
-                        range_str[..range_str.len() - 1].to_string()
-                    } else {
-                        range_str
-                    };
-                    range_str = if range_str.starts_with(',') {
-                        range_str[1..].to_string()
-                    } else {
-                        range_str
-                    };
-                    println!("Undetected ranges: {} {}", undetected_ranges.join(","), range_str);
-                    satisfiable_ranges
-                } else {
-                    satisfiable_ranges
-                };
+                    .collect();
 
                 let content_type = self.content_type;
-                if satisfiable_ranges.is_empty() {
-                    eprintln!("No satisfiable ranges found");
-                    if range_str == "bytes=0-0" {
-                        eprintln!("bytes=0-0, returning zero-length range response");
-                        // Special case for zero-length range request
-                        let content_range = ContentRange::bytes(0..0, total_bytes)
-                            .expect("ContentRange::bytes cannot panic in this usage");
-                        let content_length = ContentLength(total_bytes);
-                        let stream = RangedStream::new(self.body, 0, 0);
-                        return Ok(RangedResponse::Single {
-                            content_range,
-                            content_length,
-                            stream,
-                            content_type,
-                        });
-                    } else if range_str == "bytes=0-" {
-                        let start = total_bytes.saturating_sub(1);
-                        let content_range = ContentRange::bytes(start..total_bytes, total_bytes)
-                            .expect("ContentRange::bytes cannot panic in this usage");
-                        let content_length = ContentLength(total_bytes);
-                        let stream = RangedStream::new(self.body, start, total_bytes - start);
-                        return Ok(RangedResponse::Single {
-                            content_range,
-                            content_length,
-                            stream,
-                            content_type,
-                        });
-                    } else {
-                        if range_str.starts_with("bytes=") {
-                            let bytes = range_str[6..].trim();
-                            println!("bytes: {}", bytes);
-                            // If the range is like "bytes=-n", we can return the last n bytes
-                            let n: i64 = bytes.parse().unwrap();
-                            if n < 0 {
-                                eprintln!("Requested range is negative: {}, seeking from the end", n);
-                                // but that's ok, we can just return the whole file, or the block size
-                                // let n = total_bytes.wrapping_add(n as u64);
-                                if -n > total_bytes as i64 {
-                                    eprintln!("Requested range ({n}) exceeds total bytes, adjusting to total bytes ({total_bytes})");
-                                    let content_range = ContentRange::bytes(0..total_bytes, total_bytes)
-                                        .expect("ContentRange::bytes cannot panic in this usage");
-                                    let content_length = ContentLength(total_bytes);
-                                    let stream = RangedStream::new(self.body, 0, total_bytes);
-                                    return Ok(RangedResponse::Single {
-                                        content_range,
-                                        content_length,
-                                        stream,
-                                        content_type,
-                                    });
-                                } else {
-                                    todo!();
-                                }
-                            } else {
-                                todo!();
-                            }
-                            // let start = total_bytes.saturating_sub((-n) as u64);
-                            // let content_range = ContentRange::bytes(start..total_bytes, total_bytes)
-                            //     .expect("ContentRange::bytes cannot panic in this usage");
-                            // let content_length = ContentLength(n);
-                            // let stream = RangedStream::new(self.body, start, n);
-                            // return Ok(RangedResponse::Single {
-                            //     content_range,
-                            //     content_length,
-                            //     stream,
-                            // });
-                        } else {
-                            let bytes = range_str[6..].trim();
-                            eprintln!("bytes: {}", bytes);
-                            // if "bytes=-n" is requested, we can return the last n bytes up to the length of the file/block size
-                            eprintln!("No satisfiable ranges found for range: {}", range_str);
-                            todo!();
-                        }
-                    }
-                    // TODO: try harder to match ranges that are RFC compliant
-                    eprintln!("No satisfiable ranges found");
-                    return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
-                }
-
-                if satisfiable_ranges.len() == 1 {
-                    eprintln!("Single satisfiable range found: {:?}", satisfiable_ranges[0]);
-                    // Single range response
-                    let range = &satisfiable_ranges[0];
+                let content_length = ContentLength(total_bytes);
+                if let [range] = satisfiable_ranges.as_slice() {
                     let content_range = ContentRange::bytes(range.start..range.end_exclusive, total_bytes)
                         .expect("ContentRange::bytes cannot panic in this usage");
-                    let content_length = ContentLength(total_bytes);
                     let stream = RangedStream::new(self.body, range.start, range.len());
-                    eprintln!("Single satisfiable range found: {} / {}", range.len(), total_bytes);
-
-                    if Some(range.end_exclusive - range.start) == Some(content_length.0) {
-                        // If the content length matches the range length, we can return 200 OK
-                        Ok(RangedResponse::Full {
-                            content_length,
-                            stream,
-                            content_type,
-                        })
-                    } else {
-                        // If the content length does not match, we return 206 Partial Content
-                        Ok(RangedResponse::Single {
-                            content_range,
-                            content_length,
-                            stream,
-                            content_type,
-                        })
-                    }
+                    Ok(RangedResponse::Single {
+                        content_range,
+                        content_length,
+                        stream,
+                        content_type,
+                    })
                 } else {
-                    // Multiple ranges response
                     let boundary = generate_boundary();
                     let multipart_stream = MultipartStream::new(self.body, satisfiable_ranges, total_bytes, boundary.clone(), content_type.clone());
-                    
-                    let content_length = ContentLength(total_bytes);
                     Ok(RangedResponse::Multiple {
                         boundary,
                         stream: multipart_stream,
@@ -447,7 +255,6 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
                         content_type,
                     })
                 }
-
             }
         }
 
@@ -503,278 +310,78 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
 enum ParseRangesError {
     InvalidRange(String),
     InvalidByteRange(String),
-    InvalidSuffixRange(String),
-}
-
-fn parse_ranges(range_str: String) -> Result<(Vec<(Bound<i64>, Bound<i64>)>, Option<Option<u64>>), ParseRangesError> {
-    // let mut ranges = Vec::new();
-    // let mut suffix_length = None;
-    let mut range_secs = range_str.trim().split("/");
-    if let Some(range_str) = range_secs.next() {
-        // If the range string is empty, return an error
-        if range_str.is_empty() {
-            return Err(ParseRangesError::InvalidRange(range_str.to_string()));
-        }
-        // TODO: parse the ranges string
-    } else {
-        return Err(ParseRangesError::InvalidRange(range_str.to_string()));
-    }
-    if let Some(exp_total_len) = range_secs.next() {
-        // If the expected total length is not a valid number, return an error
-        if let Ok(len) = exp_total_len.parse::<u64>() {
-            // If the length is zero, we can return an empty range
-            if len == 0 {
-                return Ok((Vec::new(), Some(None)));
-            }
-        } else {
-            return Err(ParseRangesError::InvalidRange(exp_total_len.to_string()));
-        }
-    } else {
-        // If there is no expected total length, the client does not know the total length
-    }
-    // let [be, len] = range_str.collect::<Vec<_>>()[..] else {
-    //     return Err(ParseRangesError::InvalidRange(range_str.to_string()));
-    // };
-    // for section in range_str {
-    //     if section.trim().is_empty() {
-    //         continue;
-    //     }
-    //     // If the section is not a valid range, return an error
-    //     if !section.starts_with("bytes=") && !section.starts_with("bytes=-") {
-    //         return Err(ParseRangesError::InvalidRange(section.to_string()));
-    //     }
-    // }
-    // for range in range_str.split(',') {
-    //     let range = range.trim();
-    //     if range.is_empty() {
-    //         continue;
-    //     }
-    //     if range.starts_with("bytes=") {
-    //         let bytes = &range[6..];
-    //         if bytes.contains('-') {
-    //             let parts: Vec<&str> = bytes.split('-').collect();
-    //             if parts.len() != 2 {
-    //                 return Err(ParseRangesError::InvalidRange(range.to_string()));
-    //             }
-    //             let start = parts[0].parse::<i64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?;
-    //             let end = parts[1].parse::<i64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?;
-    //             ranges.push((Bound::Included(start), Bound::Included(end)));
-    //         } else {
-    //             return Err(ParseRangesError::InvalidRange(range.to_string()));
-    //         }
-    //     } else if range.starts_with("bytes=-") {
-    //         let suffix_len = &range[7..];
-    //         let suffix_length_value = suffix_len.parse::<u64>().map_err(|_| ParseRangesError::InvalidSuffixRange(range.to_string()))?;
-    //         suffix_length = Some(Some(suffix_length_value));
-    //     } else {
-    //         return Err(ParseRangesError::InvalidRange(range.to_string()));
-    //     }
-    // }
-    // println!("Parsed ranges: {:?}", ranges);
-    // if ranges.is_empty() && suffix_length.is_none() {
-    //     return Err(ParseRangesError::InvalidRange(range_str));
-    // }
-    // Ok((ranges, suffix_length))
-    todo!();
+    Unsatisfiable(String),
 }
 
 trait RangeParser {
     fn supported_ranges(&self) -> Vec<String>;
 }
 
+/// Parses a `Range` header value into the byte ranges it selects from a
+/// representation of `target_size` bytes, as inclusive bounds, sorted and with
+/// overlapping ranges merged.
+///
+/// Per RFC 9110 §14.1.2, a last-byte-pos at or past the end is clamped to the
+/// last byte, and a suffix longer than the representation selects all of it.
+/// Ranges starting past the end are dropped; if none remain, the set is
+/// unsatisfiable.
 fn parse_range_header(range_header: &str, target_size: u64) -> Result<Vec<(Bound<u64>, Bound<u64>)>, ParseRangesError> {
-    println!("Parsing range header ({target_size}): {range_header}");
-    let end_index = target_size - 1;
-    if range_header.is_empty() {
-        return Ok(vec![(Bound::Included(0), Bound::Included(end_index))]);
-    }
-
-    let bytes_ = "bytes=";
-    if !range_header.starts_with(bytes_) {
-        eprintln!("Range header does not start with '{}'", bytes_);
+    let Some(specs) = range_header.strip_prefix("bytes=") else {
         return Err(ParseRangesError::InvalidRange(range_header.to_string()));
+    };
+    if target_size == 0 {
+        return Err(ParseRangesError::Unsatisfiable(range_header.to_string()));
     }
+    let end_index = target_size - 1;
 
-    let mut ranges = Vec::new();
-    for range in range_header[bytes_.len()..].split(',') {
-        let split: Vec<&str> = range.split('-').collect();
-        match split.len() {
-            1 => {
-                println!("Single range: {}", split[0]);
-                match split[0].parse::<u64>() {
-                    Ok(start) => {
-                        if start > end_index {
-                            eprintln!("Start position {} exceeds end index {}", start, end_index);
-                            return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                        }
-                        ranges.push((Bound::Included(start), Bound::Included(end_index)));
-                    }
-                    Err(_) => {
-                        match split[0].parse::<i64>() {
-                            Ok(start) if start < 0 => {
-                                let start = end_index.saturating_sub((-start) as u64);
-                                ranges.push((Bound::Included(start), Bound::Unbounded));
-                            }
-                            _ => {
-                                eprintln!("Start position {} is not valid", split[0]);
-                                return Err(ParseRangesError::InvalidByteRange(range.to_string()))
-                            }
-                        }
-                    },
-                }
-                // let start = split[0].parse::<u64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?;
-                // ranges.push((Bound::Included(start), Bound::Included(end_index)));
-            }
-            2 => {
-                eprintln!("Range with start and end: '{}'-'{}'", split[0], split[1]);
-                let start = if split[0].is_empty() {
-                    println!("split[0] is empty");
-                    // parse ranges of the form "bytes=-100" (i.e., last 100 bytes)
-                    if split[1].is_empty() {
-                        eprintln!("Invalid range format: {}", range);
-                        return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                    } else {
-                        println!("Last bytes range: {}", split[1]);
-                        let split: Vec<&str> = split[1].split('/').collect();
-                        match split[0].parse::<u64>() {
-                            Ok(start) => {
-                                let end = end_index;
-                                // If the end is negative, we calculate the start position from the end index
-                                eprintln!("Start position: {start} (end index: {end_index})");
-                                let (start, end) = if start > end_index {
-                                    eprintln!("Start position {} exceeds end index {}", start, end_index);
-                                    return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                                } else {
-                                    (end_index.saturating_sub(start), end_index)
-                                };
-                                ranges.push((Bound::Included(start+1), Bound::Unbounded));
-                                continue;
-                            }
-                            _ => {
-                                eprintln!("End position {} is not valid", split[1]);
-                                return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                            }
-                        }
-                        // end_index.saturating_sub(split[1].parse::<u64>()
-                        //     .inspect_err(|e| eprintln!("Failed to parse end index from '{}': {}", split[1], e))
-                        //     .map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?)
-                    }
-                } else {
-                    split[0].parse::<u64>()
-                        .inspect_err(|e| eprintln!("Failed to parse start index from '{}': {}", split[0], e))
-                        .map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?
-                };
-                let end = if split[1].is_empty() {
-                    end_index
-                } else {
-                    if split[0].is_empty() {
-                        let s = format!("-{}", split[1]);
-                        let split = s.split("/").collect::<Vec<_>>();
-                        match split[0].parse::<i64>() {
-                            Ok(end) => {
-                                if -end > end_index as i64 {
-                                    end_index
-                                } else {
-                                    end_index - ((-end) as u64)
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("Could not parse int: {} ; {}", split[0], range);
-                                return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                            }
-                        }
-                    } else {
-                        println!("Range with start and end: {}->{}", split[0], split[1]);
-                        println!("Last bytes range: {}", split[1]);
-                        let split: Vec<&str> = split[1].split('/').collect();
-                        match split[0].parse::<u64>() {
-                            Ok(end) => {
-                                // let end = end_index;
-                                // If the end is negative, we calculate the start position from the end index
-                                eprintln!("Start position: {start} (end index: {end_index})");
-                                let (start, end) = if start > end_index {
-                                    eprintln!("Start position {} exceeds end index {}", start, end_index);
-                                    return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                                } else {
-                                    (end_index.saturating_sub(start), end_index)
-                                };
-                                ranges.push((Bound::Included(start+1), Bound::Unbounded));
-                                continue;
-                            }
-                            _ => {
-                                eprintln!("End position {} is not valid", split[1]);
-                                return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                            }
-                        }
-                        // match split[1].parse::<u64>() {
-                        //     Ok(end) => end,
-                        //     Err(_) => {
-                        //         match split[1].parse::<i64>() {
-                        //             Ok(end) if end < 0 => end_index.saturating_sub((-end) as u64),
-                        //             _ => {
-                        //                 eprintln!("End position {} is not valid", split[1]);
-                        //                 return Err(ParseRangesError::InvalidByteRange(range.to_string()))
-                        //             },
-                        //         }
-                        //     }
-                        // }
-                        // split[1].parse::<u64>().map_err(|_| ParseRangesError::InvalidByteRange(range.to_string()))?
-                    }
-                };
-                if end < start {
-                    return Err(ParseRangesError::InvalidByteRange(range.to_string()));
-                }
-                ranges.push((Bound::Included(start), Bound::Included(end.min(end_index))));
-            }
-            _ => {
-                eprintln!("Invalid range format: {}", range);
-                return Err(ParseRangesError::InvalidRange(range.to_string()))
-            },
-        }
-    }
+    // RFC 9110 positions are 1*DIGIT; `u64::from_str` alone would also accept a leading '+'
+    let parse_pos = |s: &str| Some(s).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?.parse::<u64>().ok();
 
-    // merge the ranges
-    let mut merged: Vec<(Bound<u64>, Bound<u64>)> = vec![];
-    ranges.sort_by_key(|r| match r.0{
-        Bound::Included(start) => start,
-        Bound::Excluded(start) => start,
-        Bound::Unbounded => 0, // Unbounded should be treated as the lowest possible start
-    });
-    for range in ranges {
-        let start = match range.0 {
-            Bound::Included(start) => start,
-            Bound::Excluded(start) => start - 1,
-            Bound::Unbounded => 0, // Unbounded should be treated as the lowest possible start
-        };
-        let end_inc = match range.1 {
-            Bound::Included(end) => end,
-            Bound::Excluded(end) => end - 1,
-            Bound::Unbounded => end_index, // Unbounded should be treated as the highest possible end
-        };
-        if merged.is_empty() {
-            merged.push((Bound::Included(start), Bound::Included(end_inc)));
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for spec in specs.split(',') {
+        // tolerate a trailing "/<length>" or "/*" on a spec
+        let spec = spec.split('/').next().unwrap_or_default().trim();
+        let invalid = || ParseRangesError::InvalidByteRange(spec.to_string());
+        let (first, last) = spec.split_once('-').ok_or_else(invalid)?;
+
+        if first.is_empty() {
+            // suffix-byte-range-spec: the last `n` bytes
+            let n = parse_pos(last).ok_or_else(invalid)?;
+            if n > 0 {
+                ranges.push((target_size.saturating_sub(n), end_index));
+            }
             continue;
         }
-        match &mut merged.last_mut().unwrap().1 {
-            Bound::Included(last_end) if &start > last_end => {
-                merged.push((Bound::Included(start), Bound::Included(end_inc)));
+
+        let first = parse_pos(first).ok_or_else(invalid)?;
+        let last = if last.is_empty() {
+            end_index
+        } else {
+            let last = parse_pos(last).ok_or_else(invalid)?;
+            if last < first {
+                return Err(invalid());
             }
-            Bound::Included(last_end) => {
-                // If the start is less than or equal to the last end, we merge the ranges
-                *last_end = *(&*last_end).max(&end_inc);
-            }
-            Bound::Excluded(last_end) if &start >= last_end => {
-                merged.push((Bound::Included(start), Bound::Included(end_inc)));
-            }
-            Bound::Excluded(last_end) => {
-                // If the start is less than or equal to the last end, we merge the ranges
-                *last_end = (*last_end).max(end_inc + 1);
-            }
-            Bound::Unbounded => break, // Unbounded end means we've already merge all possible rangesz
+            last.min(end_index)
+        };
+        if first <= end_index {
+            ranges.push((first, last));
         }
     }
 
-    Ok(merged)
+    if ranges.is_empty() {
+        return Err(ParseRangesError::Unsatisfiable(range_header.to_string()));
+    }
+
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        match merged.last_mut() {
+            Some((_, prev_last)) if first <= *prev_last => *prev_last = (*prev_last).max(last),
+            _ => merged.push((first, last)),
+        }
+    }
+
+    Ok(merged.into_iter().map(|(first, last)| (Bound::Included(first), Bound::Included(last))).collect())
 }
 
 #[test]
@@ -819,35 +426,30 @@ fn test_parse_range_header() {
         ("bytes=0-24646,100-200,300-400", 500, Ok(vec![
             (Bound::Included(0), Bound::Included(499)),
         ])),
+        ("bytes=0-100,200-300,400-500", 1000, Ok(vec![
+            (Bound::Included(0), Bound::Included(100)),
+            (Bound::Included(200), Bound::Included(300)),
+            (Bound::Included(400), Bound::Included(500))
+        ])),
+        ("bytes=0-0, -1", 500, Ok(vec![
+            (Bound::Included(0), Bound::Included(0)),
+            (Bound::Included(499), Bound::Included(499))
+        ])),
+        // a suffix longer than the representation selects all of it
+        ("bytes=-100", 62, Ok(vec![(Bound::Included(0), Bound::Included(61))])),
+        // ranges starting past the end are dropped; the rest are still served
+        ("bytes=0-9,100-", 62, Ok(vec![(Bound::Included(0), Bound::Included(9))])),
+        ("bytes=100-", 62, Err(ParseRangesError::Unsatisfiable("bytes=100-".to_string()))),
+        ("bytes=-0", 62, Err(ParseRangesError::Unsatisfiable("bytes=-0".to_string()))),
+        ("bytes=30-20", 62, Err(ParseRangesError::InvalidByteRange("30-20".to_string()))),
+        ("bytes=+1-2", 62, Err(ParseRangesError::InvalidByteRange("+1-2".to_string()))),
+        ("bytes=0-1", 0, Err(ParseRangesError::Unsatisfiable("bytes=0-1".to_string()))),
     ];
 
     for (i, (range_header, target_size, expected)) in tests.iter().enumerate() {
         let result = parse_range_header(range_header, *target_size);
         assert_eq!(result, *expected, "Failed to parse range header #{i}: {}\n{:?}", range_header, tests[i]);
     }
-}
-
-#[test]
-fn test_parse_ranges() {
-    let range_str = "bytes=0-100,200-300,400-500".to_string();
-    println!("Ranges to parse: {}", range_str);
-    let (ranges, suffix_length) = parse_ranges(range_str).unwrap();
-    assert_eq!(ranges.len(), 3);
-    assert_eq!(suffix_length, None);
-    assert_eq!(ranges[0], (Bound::Included(0), Bound::Included(101)));
-    assert_eq!(ranges[1], (Bound::Included(200), Bound::Included(301)));
-    assert_eq!(ranges[2], (Bound::Included(400), Bound::Included(501)));
-
-    let range_str = "bytes=-100".to_string();
-    let (ranges, suffix_length) = parse_ranges(range_str).unwrap();
-    assert_eq!(ranges.len(), 0);
-    assert_eq!(suffix_length, Some(Some(100)));
-
-    let range_str = "bytes=0-100".to_string();
-    let (ranges, suffix_length) = parse_ranges(range_str).unwrap();
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(suffix_length, None);
-    assert_eq!(ranges[0], (Bound::Included(0), Bound::Included(101)));
 }
 
 impl<B: RangeBody + Send + 'static> IntoResponse for Ranged<B> {
@@ -1223,35 +825,22 @@ mod rfc_compliance_tests {
         Some(Range::decode(&mut [val].iter()).unwrap())
     }
 
-    async fn create_test_file(path: &str, content: &str) -> io::Result<()> {
-        let mut file = File::create(path).await?;
-        file.write_all(content.as_bytes()).await?;
-        file.flush().await?;
-        Ok(())
-    }
-
-    // sleep for a random amount of time to ensure the file is created before reading
     async fn body(path: &str) -> KnownSize<File> {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        // Open the file and wrap it in KnownSize
-        let file = File::open(path).await.unwrap();
         let file = PathBuf::from_str(path).unwrap();
         KnownSize::file(file).await.unwrap()
     }
 
     async fn body_blocks(path: &str, block_len: u64) -> KnownSize<File> {
-        // sleep for a random amount of time to ensure the file is created before reading
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        // Open the file and wrap it in KnownSize with specified block length
-        // let file = File::open(path).await.unwrap();
         KnownSize::file_blocks(path, block_len).await.unwrap()
     }
 
-    // Test setup that creates a test file with known content
+    // Returns the path of the checked-in fixture. Tests run in parallel, so
+    // this must not rewrite the file: truncating it while another test reads
+    // it makes that test see a short or empty body.
     async fn setup() -> io::Result<String> {
         let test_path = "test/fixture_abc.txt";
         let content = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-        create_test_file(test_path, content).await?;
+        assert_eq!(content, tokio::fs::read_to_string(test_path).await?);
         Ok(test_path.to_string())
     }
 
