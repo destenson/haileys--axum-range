@@ -16,19 +16,16 @@
 //! ```
 //! use axum::Router;
 //! use axum::routing::get;
-//! use axum_extra::{TypedHeader, headers::Range};
 //!
 //! use std::path::PathBuf;
 //! use std::str::FromStr;
 //!
-//! use axum_range::Ranged;
-//! use axum_range::KnownSize;
+//! use axum_range::{KnownSize, RangeRequest, Ranged};
 //!
-//! async fn file(range: Option<TypedHeader<Range>>) -> Ranged<KnownSize<tokio::fs::File>> {
-//! let file = PathBuf::from_str("document.txt").unwrap();
+//! async fn file(request: RangeRequest) -> Ranged<KnownSize<tokio::fs::File>> {
+//!     let file = PathBuf::from_str("document.txt").unwrap();
 //!     let body = KnownSize::file(file).await.unwrap();
-//!     let range = range.map(|TypedHeader(range)| range);
-//!     Ranged::new(range, body, None)
+//!     Ranged::from_request(request, body, None)
 //! }
 //!
 //! #[tokio::main]
@@ -45,20 +42,28 @@
 //! }
 //! ```
 //!
+//! [`RangeRequest`] extracts the `Range` and `If-Range` header fields, and
+//! drops them for methods other than GET (RFC 7233 §3.1). To evaluate
+//! `If-Range` (RFC 7233 §3.2), supply the representation's current
+//! validators with [`Ranged::with_etag`] and [`Ranged::with_last_modified`].
+//!
 //! [1]: https://docs.rs/axum
 
 mod file;
 mod stream;
 
+use std::convert::Infallible;
 use std::io;
 use std::ops::Bound;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use axum::http::StatusCode;
+use axum::extract::FromRequestParts;
+use axum::http::{header, HeaderName, Method, StatusCode};
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum_extra::TypedHeader;
-use axum_extra::headers::{ContentRange, ContentLength, AcceptRanges, HeaderValue, HeaderMap, Header, Range};
+use axum_extra::headers::{ContentRange, ContentLength, AcceptRanges, ETag, HeaderValue, HeaderMap, Header, LastModified, Range};
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use file::KnownSize;
@@ -115,10 +120,55 @@ impl ByteRange {
     }
 }
 
+/// The parts of a request that decide how [`Ranged`] responds: its `Range`
+/// and `If-Range` header fields.
+///
+/// Implements [`FromRequestParts`], and never rejects. Per RFC 7233 §3.1,
+/// `Range` is only defined for GET, so for any other method (including
+/// HEAD) both fields are dropped and the response is a plain 200.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RangeRequest {
+    range: Option<HeaderValue>,
+    if_range: Option<HeaderValue>,
+}
+
+impl RangeRequest {
+    /// Build from a request's method and header fields.
+    pub fn new(method: &Method, headers: &HeaderMap) -> Self {
+        if method != Method::GET {
+            return RangeRequest::default();
+        }
+        RangeRequest {
+            range: single_field(headers, header::RANGE),
+            if_range: single_field(headers, header::IF_RANGE),
+        }
+    }
+}
+
+// Range and If-Range are not list fields, so a request carrying more than one
+// of either is malformed; treat it as absent, which ignores the range request.
+fn single_field(headers: &HeaderMap, name: HeaderName) -> Option<HeaderValue> {
+    let mut values = headers.get_all(name).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for RangeRequest {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(RangeRequest::new(&parts.method, &parts.headers))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// The main responder type. Implements [`IntoResponse`].
 pub struct Ranged<B: RangeBody + Send + 'static> {
-    range: Option<Range>,
+    request: RangeRequest,
+    etag: Option<ETag>,
+    last_modified: Option<LastModified>,
     body: B,
     content_type: Option<String>,
 }
@@ -126,8 +176,71 @@ pub struct Ranged<B: RangeBody + Send + 'static> {
 impl<B: RangeBody + Send + 'static> Ranged<B> {
     /// Construct a ranged response over any type implementing [`RangeBody`]
     /// and an optional [`Range`] header.
+    ///
+    /// The caller is responsible for only passing a `Range` received on a GET
+    /// request; [`Ranged::from_request`] handles that, and also handles
+    /// `If-Range` and range units other than `bytes`.
     pub fn new(range: Option<Range>, body: B, content_type: Option<String>) -> Self {
-        Ranged { range, body, content_type }
+        let range = range.and_then(|range| {
+            let mut values = Vec::new();
+            range.encode(&mut values);
+            values.into_iter().next()
+        });
+        Self::from_request(RangeRequest { range, if_range: None }, body, content_type)
+    }
+
+    /// Construct a ranged response for the request described by `request`.
+    pub fn from_request(request: RangeRequest, body: B, content_type: Option<String>) -> Self {
+        Ranged { request, etag: None, last_modified: None, body, content_type }
+    }
+
+    /// The current entity-tag of the representation, which an `If-Range`
+    /// entity-tag must strongly match for the range to be served
+    /// (RFC 7233 §3.2). Only used for that comparison; send the `ETag`
+    /// header field yourself.
+    pub fn with_etag(mut self, etag: ETag) -> Self {
+        self.etag = Some(etag);
+        self
+    }
+
+    /// The current modification date of the representation, which an
+    /// `If-Range` date must exactly match for the range to be served
+    /// (RFC 7233 §3.2). Only used for that comparison; send the
+    /// `Last-Modified` header field yourself.
+    ///
+    /// Only supply this if it is a strong validator (RFC 7232 §2.2.2), i.e.
+    /// the representation cannot change twice within the same second.
+    pub fn with_last_modified(mut self, last_modified: LastModified) -> Self {
+        self.last_modified = Some(last_modified);
+        self
+    }
+
+    /// Whether an `If-Range` precondition, if any, allows the range to be
+    /// served (RFC 7233 §3.2).
+    fn if_range_matches(&self) -> bool {
+        let Some(if_range) = &self.request.if_range else {
+            return true;
+        };
+        let Ok(validator) = if_range.to_str() else {
+            return false;
+        };
+        if validator.starts_with('"') {
+            // strong comparison: neither tag weak, opaque-tags equal; a strong
+            // validator equal to ours implies ours is strong too
+            self.etag.as_ref().is_some_and(|etag| {
+                let mut values = Vec::new();
+                etag.encode(&mut values);
+                values.first().is_some_and(|current| current.as_bytes() == validator.as_bytes())
+            })
+        } else if validator.starts_with("W/") {
+            // a weak entity-tag never matches by strong comparison
+            false
+        } else {
+            match (LastModified::decode(&mut std::iter::once(if_range)), &self.last_modified) {
+                (Ok(date), Some(current)) => date == *current,
+                _ => false,
+            }
+        }
     }
 
     /// Responds to the request, returning headers and body as
@@ -135,127 +248,117 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
     /// range in header was not satisfiable.
     pub fn try_respond(self) -> Result<RangedResponse<B>, RangeNotSatisfiable> {
         let total_bytes = self.body.byte_size();
-        if total_bytes == 0 {
-            println!("total bytes = 0!");
-            return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
-        }
-
         let block_len = self.body.block_len();
 
-        match self.range {
-            None => {
-                if total_bytes <= block_len {
-                    eprintln!("No range header, returning full file of size: {}", total_bytes);
-                    // no range header, return the whole file
-                    let content_length = ContentLength(total_bytes);
-                    let stream = RangedStream::new(self.body, 0, total_bytes);
-                    let content_type = self.content_type;
-                    Ok(RangedResponse::Full {
-                        content_length,
-                        stream,
-                        content_type,
-                    })
-                } else {
-                    eprintln!("No range header, returning first {} bytes of file of size: {}", block_len, total_bytes);
-                    // block_len is less than total_bytes, return the first block_len bytes
-                    let content_length = ContentLength(total_bytes);
-                    let stream = RangedStream::new(self.body, 0, block_len);
-                    let content_range = ContentRange::bytes(0..block_len, total_bytes)
-                        .expect("ContentRange::bytes cannot panic in this usage");
-                    let content_type = self.content_type;
-                    Ok(RangedResponse::Single {
-                        content_range,
-                        content_length,
-                        stream,
-                        content_type,
-                    })
+        // If-Range is evaluated before Range, and when its validator does not
+        // match the Range header field MUST be ignored (RFC 7233 §3.2)
+        let range = if self.if_range_matches() { self.request.range.clone() } else { None };
+
+        /*
+           A byte-range-spec is invalid if the last-byte-pos value is present
+           and less than the first-byte-pos.
+
+           A client can limit the number of bytes requested without knowing the
+           size of the selected representation.  If the last-byte-pos value is
+           absent, or if the value is greater than or equal to the current
+           length of the representation data, the byte range is interpreted as
+           the remainder of the representation (i.e., the server replaces the
+           value of last-byte-pos with a value that is one less than the current
+           length of the selected representation).
+
+
+           A client can request the last N bytes of the selected representation
+           using a suffix-byte-range-spec.
+
+             suffix-byte-range-spec = "-" suffix-length
+             suffix-length = 1*DIGIT
+
+           If the selected representation is shorter than the specified
+           suffix-length, the entire representation is used.
+
+           Additional examples, assuming a representation of length 10000:
+
+           o  The final 500 bytes (byte offsets 9500-9999, inclusive):
+
+                bytes=-500
+
+           Or:
+
+                bytes=9500-
+
+           o  The first and last bytes only (bytes 0 and 9999):
+
+                bytes=0-0,-1
+
+           o  Other valid (but not canonical) specifications of the second 500
+              bytes (byte offsets 500-999, inclusive):
+
+                bytes=500-600,601-999
+                bytes=500-700,601-999
+
+        */
+        let ranges = match range {
+            None => vec![],
+            Some(range) => match parse_range_header(&String::from_utf8_lossy(range.as_bytes()), total_bytes) {
+                Ok(ranges) => ranges,
+                // An origin server MUST ignore a Range header field that
+                // contains a range unit it does not understand (RFC 7233 §3.1)
+                Err(ParseRangesError::UnknownUnit(_)) => vec![],
+                // invalid or unsatisfiable: SHOULD send 416 (RFC 7233 §3.1)
+                Err(_) => {
+                    return Err(RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)));
                 }
+            },
+        };
+
+        let satisfiable_ranges: Vec<ByteRange> = ranges
+            .into_iter()
+            .map(|range| match range {
+                // HTTP byte ranges are inclusive, so we translate to exclusive by adding 1,
+                // and never serve more than one block per range
+                (Bound::Included(start), Bound::Included(end)) => {
+                    ByteRange::new(start, (end + 1).min(start.saturating_add(block_len)))
+                }
+                _ => unreachable!("parse_range_header only returns inclusive bounds"),
+            })
+            .collect();
+
+        let content_type = self.content_type;
+        let content_length = ContentLength(total_bytes);
+        match satisfiable_ranges.as_slice() {
+            // no range to serve: the request had no (applicable) Range header
+            // field, or it selected only a suffix of an empty representation,
+            // which no Content-Range can describe. 206 is only for fulfilling
+            // a range request (RFC 7233 §4.1), so send the whole representation.
+            [] => {
+                let stream = RangedStream::new(self.body, 0, total_bytes);
+                Ok(RangedResponse::Full {
+                    content_length,
+                    stream,
+                    content_type,
+                })
             }
-            Some(range) => {
-                /*
-                   A byte-range-spec is invalid if the last-byte-pos value is present
-                   and less than the first-byte-pos.
-
-                   A client can limit the number of bytes requested without knowing the
-                   size of the selected representation.  If the last-byte-pos value is
-                   absent, or if the value is greater than or equal to the current
-                   length of the representation data, the byte range is interpreted as
-                   the remainder of the representation (i.e., the server replaces the
-                   value of last-byte-pos with a value that is one less than the current
-                   length of the selected representation).
-
-
-                   A client can request the last N bytes of the selected representation
-                   using a suffix-byte-range-spec.
-
-                     suffix-byte-range-spec = "-" suffix-length
-                     suffix-length = 1*DIGIT
-
-                   If the selected representation is shorter than the specified
-                   suffix-length, the entire representation is used.
-
-                   Additional examples, assuming a representation of length 10000:
-
-                   o  The final 500 bytes (byte offsets 9500-9999, inclusive):
-
-                        bytes=-500
-
-                   Or:
-
-                        bytes=9500-
-
-                   o  The first and last bytes only (bytes 0 and 9999):
-
-                        bytes=0-0,-1
-
-                   o  Other valid (but not canonical) specifications of the second 500
-                      bytes (byte offsets 500-999, inclusive):
-
-                        bytes=500-600,601-999
-                        bytes=500-700,601-999
-
-                */
-
-                let mut values = Vec::new();
-                range.encode(&mut values);
-                let range_str = values.first().and_then(|value| value.to_str().ok()).unwrap_or_default();
-
-                let satisfiable_ranges: Vec<ByteRange> = parse_range_header(range_str, total_bytes)
-                    .map_err(|_| RangeNotSatisfiable(ContentRange::unsatisfied_bytes(total_bytes)))?
-                    .into_iter()
-                    .map(|range| match range {
-                        // HTTP byte ranges are inclusive, so we translate to exclusive by adding 1,
-                        // and never serve more than one block per range
-                        (Bound::Included(start), Bound::Included(end)) => {
-                            ByteRange::new(start, (end + 1).min(start.saturating_add(block_len)))
-                        }
-                        _ => unreachable!("parse_range_header only returns inclusive bounds"),
-                    })
-                    .collect();
-
-                let content_type = self.content_type;
-                let content_length = ContentLength(total_bytes);
-                if let [range] = satisfiable_ranges.as_slice() {
-                    let content_range = ContentRange::bytes(range.start..range.end_exclusive, total_bytes)
-                        .expect("ContentRange::bytes cannot panic in this usage");
-                    let stream = RangedStream::new(self.body, range.start, range.len());
-                    Ok(RangedResponse::Single {
-                        content_range,
-                        content_length,
-                        stream,
-                        content_type,
-                    })
-                } else {
-                    let boundary = generate_boundary();
-                    let multipart_stream = MultipartStream::new(self.body, satisfiable_ranges, total_bytes, boundary.clone(), content_type.clone());
-                    let content_length = ContentLength(multipart_stream.byte_len());
-                    Ok(RangedResponse::Multiple {
-                        boundary,
-                        stream: multipart_stream,
-                        content_length,
-                        content_type,
-                    })
-                }
+            [range] => {
+                let content_range = ContentRange::bytes(range.start..range.end_exclusive, total_bytes)
+                    .expect("ContentRange::bytes cannot panic in this usage");
+                let stream = RangedStream::new(self.body, range.start, range.len());
+                Ok(RangedResponse::Single {
+                    content_range,
+                    content_length,
+                    stream,
+                    content_type,
+                })
+            }
+            _ => {
+                let boundary = generate_boundary();
+                let multipart_stream = MultipartStream::new(self.body, satisfiable_ranges, total_bytes, boundary.clone(), content_type.clone());
+                let content_length = ContentLength(multipart_stream.byte_len());
+                Ok(RangedResponse::Multiple {
+                    boundary,
+                    stream: multipart_stream,
+                    content_length,
+                    content_type,
+                })
             }
         }
 
@@ -309,7 +412,7 @@ impl<B: RangeBody + Send + 'static> Ranged<B> {
 
 #[derive(Debug, Clone, PartialEq)]
 enum ParseRangesError {
-    InvalidRange(String),
+    UnknownUnit(String),
     InvalidByteRange(String),
     Unsatisfiable(String),
 }
@@ -323,22 +426,24 @@ trait RangeParser {
 /// ranges are merged, and the rest keep the order they were requested in,
 /// as RFC 7233 §4.1 asks of multipart responses.
 ///
-/// Per RFC 9110 §14.1.2, a last-byte-pos at or past the end is clamped to the
+/// Per RFC 7233 §2.1, a last-byte-pos at or past the end is clamped to the
 /// last byte, and a suffix longer than the representation selects all of it.
-/// Ranges starting past the end are dropped; if none remain, the set is
-/// unsatisfiable.
+/// Ranges starting past the end are dropped. The set is satisfiable if any
+/// range starts before the end or any suffix is non-zero; otherwise it is
+/// an error. A satisfiable set over an empty representation selects nothing,
+/// so it returns no ranges.
 fn parse_range_header(range_header: &str, target_size: u64) -> Result<Vec<(Bound<u64>, Bound<u64>)>, ParseRangesError> {
-    let Some(specs) = range_header.strip_prefix("bytes=") else {
-        return Err(ParseRangesError::InvalidRange(range_header.to_string()));
+    // range-unit is a token, compared case-insensitively (RFC 7233 §2, Appendix C)
+    let specs = match range_header.split_once('=') {
+        Some((unit, specs)) if unit.eq_ignore_ascii_case("bytes") => specs,
+        _ => return Err(ParseRangesError::UnknownUnit(range_header.to_string())),
     };
-    if target_size == 0 {
-        return Err(ParseRangesError::Unsatisfiable(range_header.to_string()));
-    }
-    let end_index = target_size - 1;
+    let end_index = target_size.checked_sub(1);
 
-    // RFC 9110 positions are 1*DIGIT; `u64::from_str` alone would also accept a leading '+'
+    // byte positions are 1*DIGIT (RFC 7233 §2.1); `u64::from_str` alone would also accept a leading '+'
     let parse_pos = |s: &str| Some(s).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?.parse::<u64>().ok();
 
+    let mut satisfiable = false;
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     for spec in specs.split(',') {
         // tolerate a trailing "/<length>" or "/*" on a spec
@@ -350,27 +455,28 @@ fn parse_range_header(range_header: &str, target_size: u64) -> Result<Vec<(Bound
             // suffix-byte-range-spec: the last `n` bytes
             let n = parse_pos(last).ok_or_else(invalid)?;
             if n > 0 {
-                ranges.push((target_size.saturating_sub(n), end_index));
+                satisfiable = true;
+                if let Some(end_index) = end_index {
+                    ranges.push((target_size.saturating_sub(n), end_index));
+                }
             }
             continue;
         }
 
         let first = parse_pos(first).ok_or_else(invalid)?;
-        let last = if last.is_empty() {
-            end_index
-        } else {
-            let last = parse_pos(last).ok_or_else(invalid)?;
-            if last < first {
-                return Err(invalid());
-            }
-            last.min(end_index)
+        let last = match parse_pos(last) {
+            None if last.is_empty() => None,
+            None => return Err(invalid()),
+            Some(last) if last < first => return Err(invalid()),
+            Some(last) => Some(last),
         };
-        if first <= end_index {
-            ranges.push((first, last));
+        if let Some(end_index) = end_index.filter(|&end_index| first <= end_index) {
+            satisfiable = true;
+            ranges.push((first, last.map_or(end_index, |last| last.min(end_index))));
         }
     }
 
-    if ranges.is_empty() {
+    if !satisfiable {
         return Err(ParseRangesError::Unsatisfiable(range_header.to_string()));
     }
 
@@ -428,8 +534,10 @@ fn test_parse_range_header() {
         ("bytes=0-24646/*", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
         ("bytes=0-24646", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
         ("bytes=0-24646/25000", 500, Ok(vec![(Bound::Included(0), Bound::Included(499))])),
-        ("none", 500, Err(ParseRangesError::InvalidRange("none".to_string()))),
-        ("bleets=100-324", 500, Err(ParseRangesError::InvalidRange("bleets=100-324".to_string()))),
+        ("none", 500, Err(ParseRangesError::UnknownUnit("none".to_string()))),
+        ("bleets=100-324", 500, Err(ParseRangesError::UnknownUnit("bleets=100-324".to_string()))),
+        ("Bytes=0-9", 500, Ok(vec![(Bound::Included(0), Bound::Included(9))])),
+        ("BYTES=0-9", 500, Ok(vec![(Bound::Included(0), Bound::Included(9))])),
         ("bytes=0-24646,100-200", 500, Ok(vec![
             (Bound::Included(0), Bound::Included(499))
         ])),
@@ -453,7 +561,10 @@ fn test_parse_range_header() {
         ("bytes=-0", 62, Err(ParseRangesError::Unsatisfiable("bytes=-0".to_string()))),
         ("bytes=30-20", 62, Err(ParseRangesError::InvalidByteRange("30-20".to_string()))),
         ("bytes=+1-2", 62, Err(ParseRangesError::InvalidByteRange("+1-2".to_string()))),
+        // empty representation: only a non-zero suffix is satisfiable, and it selects nothing
         ("bytes=0-1", 0, Err(ParseRangesError::Unsatisfiable("bytes=0-1".to_string()))),
+        ("bytes=-5", 0, Ok(vec![])),
+        ("bytes=-0", 0, Err(ParseRangesError::Unsatisfiable("bytes=-0".to_string()))),
         // parts keep request order; a merged range takes the position of its earliest member
         ("bytes=40-49,0-9", 62, Ok(vec![
             (Bound::Included(40), Bound::Included(49)),
@@ -548,14 +659,7 @@ impl<B: RangeBody + Send + 'static> IntoResponse for RangedResponse<B> {
                     // ("Content-Length", content_length.0.into()), // this causes problems if included
                     ("Content-Type", HeaderValue::from_str(&content_type.unwrap_or_else(|| "application/octet-stream".to_string())).unwrap())
                 ];
-                if content_length.0 == 0 {
-                    // If the content length is zero, we should return 204 No Content
-                    (StatusCode::NO_CONTENT, headers, stream).into_response()
-                } else if Some(content_length.0) != content_range.bytes_range().map(|(start, end)| end-start) {
-                    (StatusCode::PARTIAL_CONTENT, headers, stream).into_response()
-                } else {
-                    (StatusCode::OK, headers, stream).into_response()
-                }
+                (StatusCode::PARTIAL_CONTENT, headers, stream).into_response()
             }
             Multiple { /*content_ranges, content_length,*/ stream, boundary, content_type, content_length } => {
                 // headers.insert("Content-Type", HeaderValue::from_str(&format!("multipart/byteranges; boundary={}", boundary)).unwrap());
@@ -2681,3 +2785,212 @@ Fielding, et al.             Standards Track                   [Page 25]
  */
 
 
+
+#[cfg(test)]
+mod rfc7233_tests {
+    use std::io::Cursor;
+    use std::time::{Duration, SystemTime};
+
+    use axum::body::to_bytes;
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum_extra::headers::{ETag, LastModified};
+
+    use crate::{KnownSize, RangeRequest, Ranged};
+
+    const CONTENT: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    fn body(content: &'static [u8]) -> KnownSize<Cursor<&'static [u8]>> {
+        KnownSize::sized(Cursor::new(content), content.len() as u64)
+    }
+
+    fn request(method: Method, fields: &[(&'static str, &'static str)]) -> RangeRequest {
+        let mut headers = HeaderMap::new();
+        for (name, value) in fields {
+            headers.append(*name, HeaderValue::from_static(value));
+        }
+        RangeRequest::new(&method, &headers)
+    }
+
+    fn get(fields: &[(&'static str, &'static str)]) -> RangeRequest {
+        request(Method::GET, fields)
+    }
+
+    async fn respond(ranged: Ranged<KnownSize<Cursor<&'static [u8]>>>) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let response: Response = ranged.into_response();
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, parts.headers, body.to_vec())
+    }
+
+    fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).map(|value| value.to_str().unwrap())
+    }
+
+    // §4.1: 206 only fulfils a range request, so a block-limited body is
+    // still sent whole when there is no Range header field
+    #[tokio::test]
+    async fn no_range_on_block_limited_body_is_full_200() {
+        let body = KnownSize::sized_blocks(Cursor::new(CONTENT), CONTENT.len() as u64, 10);
+        let (status, headers, content) = respond(Ranged::from_request(get(&[]), body, None)).await;
+        assert_eq!(StatusCode::OK, status);
+        assert_eq!(None, header(&headers, "content-range"));
+        assert_eq!(CONTENT, &content[..]);
+    }
+
+    // a range request on a block-limited body may be served partially; the
+    // Content-Range says what was sent
+    #[tokio::test]
+    async fn range_on_block_limited_body_is_capped_206() {
+        let body = KnownSize::sized_blocks(Cursor::new(CONTENT), CONTENT.len() as u64, 10);
+        let (status, headers, content) = respond(Ranged::from_request(get(&[("range", "bytes=0-29")]), body, None)).await;
+        assert_eq!(StatusCode::PARTIAL_CONTENT, status);
+        assert_eq!(Some("bytes 0-9/62"), header(&headers, "content-range"));
+        assert_eq!(b"0123456789", &content[..]);
+    }
+
+    #[tokio::test]
+    async fn empty_representation_without_range_is_200() {
+        let (status, headers, content) = respond(Ranged::from_request(get(&[]), body(b""), None)).await;
+        assert_eq!(StatusCode::OK, status);
+        assert_eq!(Some("0"), header(&headers, "content-length"));
+        assert!(content.is_empty());
+    }
+
+    // §2.1: a non-zero suffix is satisfiable even on an empty representation,
+    // but no Content-Range can describe zero bytes, so Range is ignored (§3.1)
+    #[tokio::test]
+    async fn empty_representation_with_suffix_range_is_200() {
+        let (status, _, content) = respond(Ranged::from_request(get(&[("range", "bytes=-5")]), body(b""), None)).await;
+        assert_eq!(StatusCode::OK, status);
+        assert!(content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_representation_with_range_is_416() {
+        let (status, headers, _) = respond(Ranged::from_request(get(&[("range", "bytes=0-")]), body(b""), None)).await;
+        assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, status);
+        assert_eq!(Some("bytes */0"), header(&headers, "content-range"));
+    }
+
+    #[tokio::test]
+    async fn range_covering_everything_is_206() {
+        let (status, headers, content) = respond(Ranged::from_request(get(&[("range", "bytes=0-")]), body(CONTENT), None)).await;
+        assert_eq!(StatusCode::PARTIAL_CONTENT, status);
+        assert_eq!(Some("bytes 0-61/62"), header(&headers, "content-range"));
+        assert_eq!(CONTENT, &content[..]);
+    }
+
+    // §3.1: a server MUST ignore a Range header field received with a request
+    // method other than GET
+    #[tokio::test]
+    async fn range_on_other_methods_is_ignored() {
+        for method in [Method::HEAD, Method::POST, Method::PUT] {
+            let ranged = Ranged::from_request(request(method.clone(), &[("range", "bytes=0-9")]), body(CONTENT), None);
+            let (status, headers, _) = respond(ranged).await;
+            assert_eq!(StatusCode::OK, status, "{method}");
+            assert_eq!(None, header(&headers, "content-range"), "{method}");
+            assert_eq!(Some("62"), header(&headers, "content-length"), "{method}");
+        }
+    }
+
+    // §3.1: an origin server MUST ignore a Range header field that contains a
+    // range unit it does not understand
+    #[tokio::test]
+    async fn unknown_range_unit_is_ignored() {
+        for range in ["items=0-5", "bytes 0-5", "none"] {
+            let (status, _, content) = respond(Ranged::from_request(get(&[("range", range)]), body(CONTENT), None)).await;
+            assert_eq!(StatusCode::OK, status, "{range}");
+            assert_eq!(CONTENT, &content[..], "{range}");
+        }
+    }
+
+    // §2: range-unit is compared case-insensitively
+    #[tokio::test]
+    async fn range_unit_is_case_insensitive() {
+        let (status, _, content) = respond(Ranged::from_request(get(&[("range", "Bytes=0-1")]), body(CONTENT), None)).await;
+        assert_eq!(StatusCode::PARTIAL_CONTENT, status);
+        assert_eq!(b"01", &content[..]);
+    }
+
+    // §3.1: invalid or unsatisfiable range sets SHOULD get 416
+    #[tokio::test]
+    async fn invalid_or_unsatisfiable_range_is_416() {
+        for range in ["bytes=9-0", "bytes=x-1", "bytes=62-", "bytes=-0"] {
+            let (status, headers, _) = respond(Ranged::from_request(get(&[("range", range)]), body(CONTENT), None)).await;
+            assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, status, "{range}");
+            assert_eq!(Some("bytes */62"), header(&headers, "content-range"), "{range}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_range_field_is_ignored() {
+        let request = get(&[("range", "bytes=0-1"), ("range", "bytes=2-3")]);
+        let (status, _, _) = respond(Ranged::from_request(request, body(CONTENT), None)).await;
+        assert_eq!(StatusCode::OK, status);
+    }
+
+    fn etag(tag: &'static str) -> ETag {
+        tag.parse().unwrap()
+    }
+
+    // 2015-10-21T07:28:00Z
+    fn date() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480)
+    }
+
+    const DATE: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
+    const DATE_EARLIER: &str = "Wed, 21 Oct 2015 07:27:59 GMT";
+    const DATE_LATER: &str = "Wed, 21 Oct 2015 07:28:01 GMT";
+
+    async fn if_range(validator: &'static str, current_etag: Option<&'static str>, current_date: bool) -> StatusCode {
+        let mut ranged = Ranged::from_request(get(&[("range", "bytes=0-9"), ("if-range", validator)]), body(CONTENT), None);
+        if let Some(tag) = current_etag {
+            ranged = ranged.with_etag(etag(tag));
+        }
+        if current_date {
+            ranged = ranged.with_last_modified(LastModified::from(date()));
+        }
+        respond(ranged).await.0
+    }
+
+    // §3.2: if the validator matches, the range is served; otherwise the
+    // Range header field MUST be ignored
+    #[tokio::test]
+    async fn if_range_entity_tag() {
+        assert_eq!(StatusCode::PARTIAL_CONTENT, if_range("\"v1\"", Some("\"v1\""), false).await);
+        assert_eq!(StatusCode::OK, if_range("\"v0\"", Some("\"v1\""), false).await);
+        // no current entity-tag to compare against
+        assert_eq!(StatusCode::OK, if_range("\"v1\"", None, true).await);
+    }
+
+    // §3.2: entity-tags are compared with the strong comparison function, so
+    // a weak tag on either side never matches
+    #[tokio::test]
+    async fn if_range_weak_entity_tag_never_matches() {
+        assert_eq!(StatusCode::OK, if_range("W/\"v1\"", Some("W/\"v1\""), false).await);
+        assert_eq!(StatusCode::OK, if_range("W/\"v1\"", Some("\"v1\""), false).await);
+        assert_eq!(StatusCode::OK, if_range("\"v1\"", Some("W/\"v1\""), false).await);
+    }
+
+    // §3.2: an HTTP-date must match exactly, unlike the "earlier than or
+    // equal to" comparison of If-Unmodified-Since
+    #[tokio::test]
+    async fn if_range_date_exact_match() {
+        assert_eq!(StatusCode::PARTIAL_CONTENT, if_range(DATE, None, true).await);
+        assert_eq!(StatusCode::OK, if_range(DATE_EARLIER, None, true).await);
+        assert_eq!(StatusCode::OK, if_range(DATE_LATER, None, true).await);
+        // no current date to compare against
+        assert_eq!(StatusCode::OK, if_range(DATE, Some("\"v1\""), false).await);
+        assert_eq!(StatusCode::OK, if_range("not a date", None, true).await);
+    }
+
+    // §3.2: a server MUST ignore If-Range without Range
+    #[tokio::test]
+    async fn if_range_without_range_is_ignored() {
+        let ranged = Ranged::from_request(get(&[("if-range", "\"v1\"")]), body(CONTENT), None).with_etag(etag("\"v1\""));
+        let (status, _, content) = respond(ranged).await;
+        assert_eq!(StatusCode::OK, status);
+        assert_eq!(CONTENT, &content[..]);
+    }
+}

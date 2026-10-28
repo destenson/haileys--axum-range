@@ -11,21 +11,16 @@ MIT license.
 ### Example usage
 
 ```rust
-use axum_extra::TypedHeader;
-use axum_extra::headers::Range;
-
 use std::path::PathBuf;
 
 use tokio::fs::File;
 
-use axum_range::Ranged;
-use axum_range::KnownSize;
+use axum_range::{KnownSize, RangeRequest, Ranged};
 
-async fn file(range: Option<TypedHeader<Range>>) -> Ranged<KnownSize<File>> {
+async fn file(request: RangeRequest) -> Ranged<KnownSize<File>> {
     let file = PathBuf::from("archlinux-x86_64.iso");
     let body = KnownSize::file(file).await.unwrap();
-    let range = range.map(|TypedHeader(range)| range);
-    Ranged::new(range, body, None)
+    Ranged::from_request(request, body, None)
 }
 ```
 
